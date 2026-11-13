@@ -34,6 +34,7 @@ class El {
   constructor(tag) {
     this.tagName = String(tag || 'div').toUpperCase();
     this.children = [];
+    this.listeners = {};
     this.attrs = {};
     this.classList = new ClassList();
     this.style = {};
@@ -57,8 +58,9 @@ class El {
 
   setAttribute(k, v) { this.attrs[k] = String(v); }
   getAttribute(k) { return this.attrs[k] ?? null; }
-  addEventListener() {}
-  removeEventListener() {}
+  addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+  removeEventListener(type, fn) { this.listeners[type] = (this.listeners[type] || []).filter((f) => f !== fn); }
+  click() { (this.listeners.click || []).forEach((fn) => fn({ stopPropagation() {} })); }
   getBoundingClientRect() { return { top: 0, bottom: 40, left: 0, right: 120 }; }
   querySelector() { return null; }
   querySelectorAll() { return []; }
@@ -345,6 +347,62 @@ await checkAsync('密钥操作遇到 404 仍然重拉', async () => {
   }
   if (reloads !== 1) throw new Error(`404 后 reload ${reloads} 次（期望 1）`);
   if (!String(el('#toast').textContent || '').includes('失败')) throw new Error('404 应仍然报错');
+});
+
+// 从操作按钮进入真实菜单，覆盖点击、请求和异步刷新。
+await new Promise((resolve) => setTimeout(resolve, 0));
+const actions = await load('actions.js');
+let menuReloads = 0;
+const requests = [];
+actions.setReload(() => { menuReloads++; return Promise.resolve(); });
+globalThis.fetch = async (url, opts = {}) => {
+  requests.push({ url, method: opts.method, body: opts.body });
+  return { ok: true, status: 200, text: async () => '{}' };
+};
+globalThis.prompt = () => 'test-group';
+globalThis.confirm = () => true;
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const menu = () => document.body.children.find((x) => x.className === 'menu');
+const clickItem = (label) => {
+  const item = menu()?.children.find((x) => x.textContent === label);
+  if (!item) throw new Error('菜单缺少 ' + label);
+  item.click();
+};
+
+await checkAsync('账号操作菜单及刷新', async () => {
+  const button = accounts.rowMenu({ id: 'a1', name: 'n1', enabled: true, email_verified: true, has_machine: true });
+  button.click();
+  if (!menu()) throw new Error('菜单未打开');
+  clickItem('停用');
+  await flush();
+  if (menu()) throw new Error('操作后菜单未关闭');
+  if (!requests.some((r) => r.url === '/admin/api/accounts' && JSON.parse(r.body).action === 'toggle')) throw new Error('没有发出账号操作');
+  if (menuReloads !== 1) throw new Error('账号操作后未刷新');
+});
+await checkAsync('密钥分组、开关、删除及刷新', async () => {
+  const button = keys.keyMenu({ key: 'sk-test-mask', enabled: true, group: 'default' });
+  button.click();
+  clickItem('改绑分组');
+  await flush();
+  if (!requests.some((r) => r.url === '/admin/api/keys' && JSON.parse(r.body).action === 'set-group')) throw new Error('没有发出分组操作');
+  if (menuReloads !== 2) throw new Error('修改分组后未刷新');
+  button.click();
+  clickItem('停用');
+  await flush();
+  if (!requests.some((r) => r.method === 'DELETE' && r.url.startsWith('/admin/api/keys?toggle='))) throw new Error('没有发出密钥开关操作');
+  if (menuReloads !== 3) throw new Error('密钥开关后未刷新');
+  button.click();
+  clickItem('删除');
+  await flush();
+  if (!requests.some((r) => r.method === 'DELETE' && r.url.startsWith('/admin/api/keys?key='))) throw new Error('没有发出密钥删除操作');
+  if (menuReloads !== 4) throw new Error('密钥删除后未刷新');
+  button.click();
+  dom.closeMenu();
+  if (menu()) throw new Error('菜单未关闭');
+});
+await checkAsync('配额刷新完成后更新页面', async () => {
+  await actions.finishCheckin(1, []);
+  if (menuReloads !== 5) throw new Error('配额刷新后未更新页面');
 });
 
 if (failures.length) {

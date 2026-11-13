@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -118,6 +119,60 @@ func TestResponsesNonStreamMapping(t *testing.T) {
 	}
 	if out["reasoning"] == nil {
 		t.Fatal("有思维链时应输出 reasoning 汇总")
+	}
+}
+
+func TestResponsesCachedTokensAsChat(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, tc := range []struct {
+			name    string
+			details string
+			want    float64
+		}{
+			{"cached", `,"prompt_tokens_details":{"cached_tokens":4608}`, 4608},
+			{"zero", `,"prompt_tokens_details":{"cached_tokens":0}`, 0},
+			{"missing", ``, 0},
+		} {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, tc.name), func(t *testing.T) {
+				u := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+					usage := `{"prompt_tokens":5000,"completion_tokens":2,"total_tokens":5002` + tc.details + `}`
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: "+`{"choices":[],"usage":`+usage+`}`+"\n\ndata: [DONE]\n\n")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}],"usage":`+usage+`}`)
+				})
+				s, key := newTestServer(t, u)
+				body := fmt.Sprintf(`{"model":"gpt-4o","stream":%t,"input":"hi"}`, stream)
+				rec := do(t, s, http.MethodPost, "/v1/responses", key, body)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("状态码 = %d：%s", rec.Code, rec.Body.String())
+				}
+				if got := u.last(t).Path; got != "/deepai_code/chat/completions" {
+					t.Fatalf("上游路径 = %q", got)
+				}
+				var response map[string]any
+				if stream {
+					for _, event := range sseEvents(t, rec.Body.String()) {
+						if event.Event == "response.completed" {
+							response, _ = event.JSON(t)["response"].(map[string]any)
+						}
+					}
+				} else {
+					response = decodeJSON[map[string]any](t, rec.Body.Bytes())
+				}
+				usage, ok := response["usage"].(map[string]any)
+				if !ok {
+					t.Fatalf("缺少用量: %#v", response)
+				}
+				details, ok := usage["input_tokens_details"].(map[string]any)
+				if !ok || details["cached_tokens"] != tc.want {
+					t.Fatalf("cached_tokens = %#v，期望 %v", usage["input_tokens_details"], tc.want)
+				}
+			})
+		}
 	}
 }
 

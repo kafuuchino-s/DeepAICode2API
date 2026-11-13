@@ -10,11 +10,13 @@
 复用桌面端登录后写入的 API Key，无需另申请密钥；纯 Go 标准库实现，
 单文件约 10 MB，零外部依赖。
 
-[![ci](https://github.com/2951461586/DeepAICode2API/actions/workflows/ci.yml/badge.svg)](https://github.com/2951461586/DeepAICode2API/actions/workflows/ci.yml) [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev) [![deps](https://img.shields.io/badge/deps-0%20(stdlib)-00ADD8)](go.mod) [![tests](https://img.shields.io/badge/tests-556%20cases-brightgreen)](https://github.com/2951461586/DeepAICode2API/actions/workflows/ci.yml)
+[![ci](https://github.com/kafuuchino-s/DeepAICode2API/actions/workflows/ci.yml/badge.svg)](https://github.com/kafuuchino-s/DeepAICode2API/actions/workflows/ci.yml) [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev) [![deps](https://img.shields.io/badge/deps-0%20(stdlib)-00ADD8)](go.mod)
 [![protocol](https://img.shields.io/badge/protocol-OpenAI%20%7C%20Anthropic-6b4fbb)](#三接口清单) [![docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](docker-compose.yml) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Ask DeepWiki](https://img.shields.io/badge/Ask%20DeepWiki-blue.svg?labelColor=000000&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAPoAAAD6AG1e1JrAAACIUlEQVRYw+2XP2gUQRTGv7d3JhYWQawkIBaCVWzETos0gmAnVoKNTSoLK0E7EQQrC20sBVFBtLPQRgTBtBaKjYgIQUSxiJq7fT+LvCGPJZdNLt4dQj5Y3u7sznzfzLw/s9IO/icANiniCujEfWdsQgBLxAbsbraPZcmBfcAt4DNwKQsZNfEUsAB8YRV12LfA6ZHuedg7AO7ed/c+UBcbQhbiu+6wXIM6EnZWkszMJe2Ke0n6I2la0v51hFeSMLN6OwIK6jJwEBdUYb2MAxRSz6sY4geiahFgLe1Hwq6YWe3us8AN4FQQU4QM64SPY69Xyr43fADgNjAPXHb3peSsD4FDQ0VLEjAHvIhBPS6AHvA1bBO9JPAXcHFbIRtJ5yzwIQZ9CZwAusDJENIkLqsG8DpNyIZJwSUk9wLHgakcesC1JCCjiHm1kYDNOEjptCxpSVK/8f73OFLxPLAYM3oCzEX7MXf/lJbc/8kWpA4HgQdpYI9IWAbeh83whi84cHXL+58EPBoQhnmm94EzwE3gZ2p/Dhzdbhg+TaRr01x7ftb4/jBwFzjXrCvDpmLW9crVLNeR9CaapoGemb2TdCERW1tNaBNQ8jktwmozqwtpqRNtdWAjARYk39IS12ZWRX7vmJmA71nQZgi36gN7gCvAj5xc3P0jcH7kx7Ik5IC73wsh14GZsZySow5002l4Jr0b6+m4eSyvpAn8lEzsx2QHo8RfUrlN+uPq4ksAAAAASUVORK5CYII=)](https://deepwiki.com/2951461586/DeepAICode2API)
 
 </div>
+
+本仓库基于 [DeepAICode2API 上游](https://github.com/2951461586/DeepAICode2API) 维护，保留上游更新，并修复 Chat 转 Responses 时客户端收到的缓存 token 数。控制台的版本检查目前仍跟踪上游 release。
 
 > ℹ️ 0.3.19 曾把 DeepAI Code 推理收窄到 **Google/Apple 登录**的账号（邮箱密码号
 > `403 social_login_required`）。**2026-11-09 复测该限制已解除**：邮箱注册号在
@@ -29,7 +31,7 @@
 | 账号接入 | 浏览器登录（Google / Apple / 邮箱密码）、桌面端凭据导入、手工 API Key；入池自动分配机器指纹与代理 |
 | 控制台 | 单页内嵌 UI：账号 / 密钥 / 日志 / 统计 / 设置 |
 | 安全 | 密钥鉴权、管理口令、同源写保护、状态文件 AES-256-GCM 可选加密 |
-| 可回归 | 556 个用例（424 顶层 + 132 子用例）/ 13.3k 行测试，`go test -race` + gofmt / vet / build / vulncheck 全绿，CI 覆盖 10 个含测试的包（另 3 个无测试）+ 前端语法与冒烟（21 条） |
+| 可回归 | `go test -race`、gofmt、vet、build / vulncheck，CI 覆盖 Go 包与前端语法和冒烟测试 |
 
 ```text
 ┌──────────────┐  /v1/chat/completions   ┌────────────────┐   Api-Key + Theos 头   ┌─────────────────────────────┐
@@ -648,16 +650,17 @@ go build -ldflags "-X main.version=v0.1.2" -o bin/deepaicode2api .
 
 - **控制台**顶部显示该版本号；点它打开 releases 页。
 - **更新检查**：控制台启动时请求 `/admin/api/version`，服务端代查
-  `api.github.com/repos/<owner>/<repo>/releases/latest` 并缓存 6 小时。
+  `api.github.com/repos/2951461586/DeepAICode2API/releases/latest` 并缓存 6 小时。
   离线、被墙或仓库不可达时只返回当前版本（`error` 字段说明原因），
   不会影响控制台使用，也不会在界面上弹错误。
 - **开发构建**（`version=dev`）不做更新比对：否则永远提示「有新版本」。
 - **Docker 构建**默认 `VERSION=docker`（解析不出 semver，因此不比对、也不提示升级）。
+  构建参数 `VERSION` 优先；旧部署中的 `APP_VERSION` 仍可用。
   想要控制台显示真实版本并在有新版时高亮：
 
   ```bash
-  VERSION=$(git describe --tags) docker compose up -d --build
-  # 等价：make docker（自动带上 git describe 的版本）
+  VERSION=v0.1.2+fork docker compose up -d --build
+  # 仓库已打版本标签时也可用 VERSION=$(git describe --tags)
   ```
 - 发版流程：`git tag v0.1.2 && git push origin v0.1.2`，再用
   `sh scripts/release.sh v0.1.2 --publish` 交叉编译各平台二进制并创建 GitHub Release
