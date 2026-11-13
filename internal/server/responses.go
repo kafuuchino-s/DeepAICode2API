@@ -42,6 +42,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	promptLen := estimatePromptLen(payload)
 
 	rls := s.newReqLog(key, nil, model.ID, "responses", stream, start, promptLen)
+	rls.allowExhausted = !modelRequiresPaidQuota(model)
 	if model.IsResponses() {
 		s.passthroughResponses(w, r, payload, affinity, rls)
 		return
@@ -72,7 +73,7 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 		writeErr(w, http.StatusBadRequest, "请求序列化失败", "invalid_request_error")
 		return
 	}
-	resp, acct, err := s.openModel(ctx, deepai.PathResponses, body, affinity, s.requestGroup(r))
+	resp, acct, err := s.openModel(ctx, deepai.PathResponses, body, affinity, s.requestGroup(r), rl.apiKey(), rl.stream, rl.allowExhausted)
 	rl.acct = acct
 	if err != nil {
 		rl.done(0, Usage{}, err)
@@ -162,7 +163,7 @@ func (s *Server) blockingResponsesAsChat(w http.ResponseWriter, r *http.Request,
 	ctx, cancel := contextWithTimeout(r, s.requestTimeout())
 	defer cancel()
 
-	out, acct, err := s.callJSON(ctx, deepai.PathChat, chatPayload, affinity, s.requestGroup(r))
+	out, acct, err := s.callJSON(ctx, deepai.PathChat, chatPayload, affinity, s.requestGroup(r), rl.apiKey(), rl.allowExhausted)
 	rl.acct = acct
 	if err != nil {
 		rl.done(0, Usage{}, err)
@@ -188,7 +189,7 @@ func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, c
 		writeErr(w, http.StatusBadRequest, "请求序列化失败", "invalid_request_error")
 		return
 	}
-	resp, acct, err := s.openModel(ctx, deepai.PathChat, body, affinity, s.requestGroup(r))
+	resp, acct, err := s.openModel(ctx, deepai.PathChat, body, affinity, s.requestGroup(r), rl.apiKey(), true, rl.allowExhausted)
 	rl.acct = acct
 	if err != nil {
 		rl.done(0, Usage{}, err)

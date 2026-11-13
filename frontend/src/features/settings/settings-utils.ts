@@ -8,6 +8,8 @@ export type Settings = {
   rate_limit_rps: number;
   rate_limit_burst: number;
   key_concurrency: number;
+  checkin_block_ms?: number;
+  preset_desktop_shape?: boolean;
   model_aliases: Record<string, string> | null;
   admin_password_set: boolean;
 };
@@ -22,6 +24,8 @@ export type SettingsDraft = {
   rate_limit_rps: string;
   rate_limit_burst: string;
   key_concurrency: string;
+  checkin_block_ms: string;
+  preset_desktop_shape: boolean;
   aliases: string;
 };
 
@@ -31,6 +35,7 @@ export function settingsToDraft(s: Settings): SettingsDraft {
     request_timeout_sec: num(s.request_timeout_sec), max_retries: num(s.max_retries), log_keep: num(s.log_keep),
     cors_origin: s.cors_origin || '', fallback_model: s.fallback_model || '', strict_model: !!s.strict_model,
     rate_limit_rps: num(s.rate_limit_rps), rate_limit_burst: num(s.rate_limit_burst), key_concurrency: num(s.key_concurrency),
+    checkin_block_ms: num(s.checkin_block_ms ?? 0), preset_desktop_shape: !!s.preset_desktop_shape,
     aliases: JSON.stringify(s.model_aliases || {}, null, 2),
   };
 }
@@ -54,11 +59,13 @@ export function buildSettingsPatch(draft: SettingsDraft): BuildPatchResult {
   const nonnegative = [draft.rate_limit_rps, draft.rate_limit_burst, draft.key_concurrency];
   if (positive.some(value => !value.trim() || !Number.isInteger(Number(value)) || Number(value) < 1) ||
       nonnegative.some(value => value.trim() && (!Number.isFinite(Number(value)) || Number(value) < 0)) ||
-      [draft.rate_limit_burst, draft.key_concurrency].some(value => value.trim() && !Number.isInteger(Number(value)))) return { error: 'number' };
+      [draft.rate_limit_burst, draft.key_concurrency].some(value => value.trim() && !Number.isInteger(Number(value))) ||
+      !draft.checkin_block_ms.trim() || !Number.isSafeInteger(Number(draft.checkin_block_ms)) || Number(draft.checkin_block_ms) < 0) return { error: 'number' };
   return { patch: {
     request_timeout_sec: Number(draft.request_timeout_sec), max_retries: Number(draft.max_retries), log_keep: Number(draft.log_keep),
     cors_origin: draft.cors_origin.trim(), fallback_model: draft.fallback_model.trim(), strict_model: draft.strict_model,
     rate_limit_rps: Number(draft.rate_limit_rps || 0), rate_limit_burst: Number(draft.rate_limit_burst || 0),
-    key_concurrency: Number(draft.key_concurrency || 0), model_aliases,
+    key_concurrency: Number(draft.key_concurrency || 0), checkin_block_ms: Number(draft.checkin_block_ms),
+    preset_desktop_shape: draft.preset_desktop_shape, model_aliases,
   } };
 }

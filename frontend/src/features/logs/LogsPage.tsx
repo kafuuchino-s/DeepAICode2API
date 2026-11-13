@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, ArrowDown, ArrowUp, CircleAlert, ListFilter, Radio, RefreshCw, RotateCcw, Search, Trash2, Unplug, X } from 'lucide-react';
 import { api } from '../../lib/api';
+import { ConfirmDialog } from '../../components/ui/confirm-dialog';
 import { useI18n } from '../../lib/i18n';
 import { emptyFilters, filtersFromHash, filtersToHash, filtersToQuery, formatCost, logOutcome, observedValue, type LogEntry, type LogFilters } from './log-utils';
 
@@ -48,6 +49,9 @@ export default function LogsPage() {
   const [sort, setSort] = useState<{ key: SortKey; desc: boolean }>({ key: 'time', desc: true });
   const [detail, setDetail] = useState<LogEntry | null>(null);
   const [notice, setNotice] = useState(false);
+  const [live, setLive] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const returnFocus = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setFilters(draft), 250);
@@ -70,6 +74,23 @@ export default function LogsPage() {
 
   const queryString = filtersToQuery(filters);
   const logs = useQuery({ queryKey: ['logs', queryString], queryFn: () => api<LogResponse>(`/admin/api/logs?${queryString}`) });
+  useEffect(() => {
+    if (!live) return;
+    let timer: number | undefined;
+    const sync = () => {
+      if (timer !== undefined) { window.clearInterval(timer); timer = undefined; }
+      const active = window.location.hash.replace(/^#/, '').split('?')[0] === 'logs';
+      if (active && document.visibilityState === 'visible') timer = window.setInterval(() => void logs.refetch(), 5_000);
+    };
+    sync();
+    document.addEventListener('visibilitychange', sync);
+    window.addEventListener('hashchange', sync);
+    return () => {
+      if (timer !== undefined) window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', sync);
+      window.removeEventListener('hashchange', sync);
+    };
+  }, [live, logs.refetch]);
   const clear = useMutation({
     mutationFn: () => api('/admin/api/logs', { method: 'DELETE' }),
     onSuccess: async () => { setNotice(true); setDetail(null); await client.invalidateQueries({ queryKey: ['logs'] }); },
@@ -119,7 +140,7 @@ export default function LogsPage() {
   const detailItem = (label: string, value: React.ReactNode) => <div className="min-w-0 rounded-lg bg-muted/45 p-3"><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 break-words text-sm">{value}</dd></div>;
 
   return <div className="space-y-6">
-    <div className="flex flex-wrap items-center justify-between gap-3"><h1 className="text-xl font-normal tracking-tight">{t('请求日志', 'Request logs')}</h1><div className="flex flex-wrap gap-2"><button className={buttonClass} type="button" onClick={() => void logs.refetch()} disabled={logs.isFetching}><RefreshCw className="size-4" aria-hidden="true" />{t('刷新', 'Refresh')}</button><button className={`${buttonClass} text-destructive`} type="button" disabled={clear.isPending} onClick={() => { setNotice(false); if (window.confirm(t('确定清空日志？此操作无法撤销。', 'Clear the request logs? This cannot be undone.'))) clear.mutate(); }}><Trash2 className="size-4" aria-hidden="true" />{t('清空日志', 'Clear logs')}</button></div></div>
+    <div className="flex flex-wrap items-center justify-between gap-3"><h1 className="text-xl font-normal tracking-tight">{t('请求日志', 'Request logs')}</h1><div className="flex flex-wrap gap-2"><label className="flex min-h-9 items-center gap-2 px-2 text-sm"><input type="checkbox" className="size-4 accent-current" checked={live} onChange={event => setLive(event.target.checked)} />{t('实时刷新（5 秒）', 'Live refresh (5 seconds)')}</label><button className={buttonClass} type="button" onClick={() => void logs.refetch()} disabled={logs.isFetching}><RefreshCw className="size-4" aria-hidden="true" />{t('刷新', 'Refresh')}</button><button className={`${buttonClass} text-destructive`} type="button" disabled={clear.isPending} onClick={() => { setNotice(false); returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; setConfirmClear(true); }}><Trash2 className="size-4" aria-hidden="true" />{t('清空日志', 'Clear logs')}</button></div></div>
     {err && <div role="alert" className="rounded-lg bg-destructive/5 p-3 text-sm text-destructive">{t('操作失败：', 'Request failed: ')}{errorText}</div>}
     {notice && <div role="status" className="rounded-lg bg-muted/70 p-3 text-sm">{t('日志已清空。', 'Logs cleared.')}</div>}
     <section aria-label={t('当前返回结果', 'Currently returned results')}><div className="grid grid-cols-2 gap-2 lg:grid-cols-4">{summaries.map(({ label, value, icon: Icon }) => <div key={label} className="min-w-0 rounded-lg bg-muted/60 p-4"><div className="flex items-start justify-between gap-2 text-xs text-muted-foreground"><span>{label}</span><Icon className="size-4 shrink-0" aria-hidden="true" /></div><p className="mt-3 text-2xl tabular-nums">{logs.data ? value.toLocaleString(locale) : '—'}</p></div>)}</div><p className="mt-2 text-xs leading-5 text-muted-foreground">{t('统计仅针对当前返回的记录。499 表示客户端断开，不计入失败；有错误信息的请求计入失败。', 'Counts cover only the returned entries. A 499 is a client disconnect, not a failure; requests with errors count as failures.')}</p></section>
@@ -139,6 +160,7 @@ export default function LogsPage() {
       <div className="hidden overflow-x-auto lg:block"><table className="w-full min-w-[920px] text-left text-xs"><thead className="border-b border-border text-muted-foreground"><tr>{sortHead('model', t('模型 / 端点', 'Model / endpoint'))}{sortHead('account', t('账号', 'Account'))}{sortHead('cost', t('成本', 'Cost'))}{sortHead('tokens', t('用量', 'Usage'))}{sortHead('status', t('状态', 'Status'))}{sortHead('latency', t('耗时', 'Latency'))}{sortHead('time', t('时间', 'Time'))}<th scope="col"><span className="sr-only">{t('详情', 'Details')}</span></th></tr></thead><tbody className="divide-y divide-border">{rows.map((log, index) => <tr key={`${log.time}-${index}`} className="align-top"><td className="px-2 py-4"><button type="button" className="break-all text-left font-medium hover:underline" onClick={() => setDetail(log)}>{log.model || '—'}</button><p className="mt-1 text-muted-foreground">{log.endpoint || '—'}</p></td><td className="max-w-40 break-all px-2 py-4 text-muted-foreground">{log.account || '—'}</td><td className="whitespace-nowrap px-2 py-4 tabular-nums">{costText(log)}</td><td className="min-w-48 px-2 py-3"><div className="grid grid-cols-2 gap-1">{usageCell(t('输入', 'In'), tokenText(log.tokens_in, log.tokens_in_reported))}{usageCell(t('输出', 'Out'), tokenText(log.tokens_out, log.tokens_out_reported))}{usageCell(t('缓存', 'Cached'), formatCached(log))}{usageCell(t('字符 入/出', 'Chars in/out'), `${numberText(log.prompt_len, locale)} / ${numberText(log.output_len, locale)}`)}</div></td><td className="px-2 py-4">{status(log)}<p className="mt-1 text-muted-foreground">{log.stream ? t('流式', 'Streaming') : t('非流式', 'Non-streaming')}</p>{log.err && <p className="mt-1 max-w-40 truncate text-destructive" title={log.err}>{log.err}</p>}</td><td className="whitespace-nowrap px-2 py-4 tabular-nums">{log.latency_ms ?? 0} ms</td><td className="whitespace-nowrap px-2 py-4 text-muted-foreground">{timeText(log.time, locale)}</td><td className="px-2 py-4"><button type="button" className="whitespace-nowrap text-muted-foreground hover:text-foreground hover:underline" onClick={() => setDetail(log)}>{t('详情', 'Details')}</button></td></tr>)}</tbody></table></div>
       <div className="divide-y divide-border lg:hidden">{rows.map((log, index) => <article className="space-y-3 py-4" key={`${log.time}-${index}`}><div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><button type="button" className="break-all text-left font-medium hover:underline" onClick={() => setDetail(log)}>{log.model || '—'}</button><p className="mt-1 text-xs text-muted-foreground">{timeText(log.time, locale)} · {log.endpoint || '—'}</p></div>{status(log)}</div><dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm"><div><dt className="text-muted-foreground">{t('账号', 'Account')}</dt><dd className="break-all">{log.account || '—'}</dd></div><div><dt className="text-muted-foreground">{t('耗时 / 流式', 'Latency / stream')}</dt><dd>{log.latency_ms ?? 0} ms / {log.stream ? t('是', 'Yes') : t('否', 'No')}</dd></div><div><dt className="text-muted-foreground">{t('字符 入 / 出', 'Chars in / out')}</dt><dd>{numberText(log.prompt_len, locale)} / {numberText(log.output_len, locale)}</dd></div><div><dt className="text-muted-foreground">{t('Token 入 / 出', 'Tokens in / out')}</dt><dd>{tokenText(log.tokens_in, log.tokens_in_reported)} / {tokenText(log.tokens_out, log.tokens_out_reported)}</dd></div><div><dt className="text-muted-foreground">{t('缓存 Token', 'Cached tokens')}</dt><dd>{formatCached(log)}</dd></div><div><dt className="text-muted-foreground">{t('成本', 'Cost')}</dt><dd>{costText(log)}</dd></div></dl>{log.err && <p className="break-words text-sm text-destructive">{log.err}</p>}<button type="button" className="text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline" onClick={() => setDetail(log)}>{t('查看详情', 'View details')}</button></article>)}</div>
     </>}
+    <ConfirmDialog open={confirmClear} onOpenChange={setConfirmClear} returnFocus={returnFocus} title={t('清空日志', 'Clear logs')} description={t('此操作无法撤销。', 'This cannot be undone.')} confirmLabel={t('清空日志', 'Clear logs')} onConfirm={() => clear.mutate()} />
     <Dialog.Root open={detail !== null} onOpenChange={open => { if (!open) setDetail(null); }}><Dialog.Portal><Dialog.Overlay className="fixed inset-0 z-40 bg-black/40" /><Dialog.Content className="fixed inset-x-0 bottom-0 z-50 max-h-[90vh] overflow-y-auto rounded-t-xl bg-background p-5 shadow-xl focus:outline-none md:bottom-auto md:left-1/2 md:top-1/2 md:w-[min(48rem,calc(100vw-3rem))] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-xl"><div className="flex items-start justify-between gap-4"><div><Dialog.Title className="text-base font-medium">{t('请求详情', 'Request details')}</Dialog.Title><Dialog.Description className="mt-1 text-xs text-muted-foreground">{detail && <>{timeText(detail.time, locale)} · {detail.endpoint || '—'}</>}</Dialog.Description></div><Dialog.Close className="rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={t('关闭', 'Close')}><X className="size-4" /></Dialog.Close></div>{detail && <dl className="mt-6 grid gap-2 sm:grid-cols-2">{detailItem(t('模型', 'Model'), detail.model || '—')}{detailItem(t('账号', 'Account'), detail.account || '—')}{detailItem(t('状态', 'Status'), status(detail))}{detailItem(t('流式', 'Stream'), detail.stream ? t('是', 'Yes') : t('否', 'No'))}{detailItem(t('耗时', 'Latency'), `${detail.latency_ms ?? 0} ms`)}{detailItem(t('成本', 'Cost'), costText(detail))}{detailItem(t('Token 入 / 出', 'Tokens in / out'), `${tokenText(detail.tokens_in, detail.tokens_in_reported)} / ${tokenText(detail.tokens_out, detail.tokens_out_reported)}`)}{detailItem(t('缓存 Token', 'Cached tokens'), formatCached(detail))}{detailItem(t('字符 入 / 出', 'Chars in / out'), `${numberText(detail.prompt_len, locale)} / ${numberText(detail.output_len, locale)}`)}{detail.err && detailItem(t('错误', 'Error'), detail.err)}</dl>}</Dialog.Content></Dialog.Portal></Dialog.Root>
   </div>;
 }

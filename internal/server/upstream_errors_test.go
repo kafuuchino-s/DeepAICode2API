@@ -1,10 +1,13 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,6 +119,43 @@ func TestEmailUnverifiedBlocksAndSkips(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "email_unverified") {
 		t.Fatalf("全池被拦时应说明是 email_unverified: %s", rec.Body.String())
+	}
+}
+
+// TestSessionBusyWaitsWithoutAnotherEligibleAccount 确保忙碌的账号不会被当成可立即换入的账号。
+func TestSessionBusyWaitsWithoutAnotherEligibleAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		other *deepai.Account
+	}{
+		{name: "only busy account"},
+		{name: "other account exhausted", other: &deepai.Account{ID: "exhausted", APIKey: "other-key", Group: "default", Enabled: true, Status: "ok", QuotaUntil: time.Now().Add(time.Hour).Unix()}},
+		{name: "other account belongs to another group", other: &deepai.Account{ID: "other-group", APIKey: "other-key", Group: "other", Enabled: true, Status: "ok"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			u := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == deepai.ModelBasePath+deepai.PathChat {
+					calls.Add(1)
+				}
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(http.StatusConflict)
+				_, _ = io.WriteString(w, `{"error":{"code":"session_busy","message":"busy"}}`)
+			})
+			s, _ := newTestServer(t, u)
+			if tc.other != nil {
+				s.Store.UpsertAccount(tc.other)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+			_, _, err := s.openModel(ctx, deepai.PathChat, []byte(chatProbeBody), "", "default", "", false, false)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("无其他可用账号时应等待重试或调用方取消，实际错误: %v", err)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("等待期间应只调用一次上游，实际 %d 次", got)
+			}
+		})
 	}
 }
 

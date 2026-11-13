@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { api } from '../src/lib/api';
-import { I18nProvider } from '../src/lib/i18n';
+import { I18nProvider, useI18n } from '../src/lib/i18n';
+import { formatTime } from '../src/features/accounts/account-utils';
 import AccountsPage from '../src/features/accounts/AccountsPage';
 import ModelsPage from '../src/features/models/ModelsPage';
 import LogsPage from '../src/features/logs/LogsPage';
@@ -27,15 +28,73 @@ beforeEach(() => {
   HTMLDialogElement.prototype.showModal = function () { this.setAttribute('open', ''); };
   HTMLDialogElement.prototype.close = function () { this.removeAttribute('open'); };
 });
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('account list compatibility', () => {
+  it('shows active quota recovery on desktop and mobile, then restores the original status at expiry', async () => {
+    vi.useFakeTimers();
+    const now = Date.UTC(2026, 0, 1) / 1000;
+    vi.setSystemTime(now * 1000);
+    const items = [
+      { ...account, id: 'waiting', email: 'waiting@example.test', quota_until: now + 10 },
+      { ...account, id: 'failure', email: 'failure@example.test', status: 'error', quota_until: now + 20 },
+      { ...account, id: 'disabled', email: 'disabled@example.test', enabled: false, quota_until: now + 20 },
+      { ...account, id: 'blocked', email: 'blocked@example.test', status: 'blocked', quota_until: now + 20 },
+      { ...account, id: 'expired', email: 'expired@example.test', quota_until: now - 1 },
+      { ...account, id: 'zero', email: 'zero@example.test', quota_until: 0 },
+      { ...account, id: 'legacy', email: 'legacy@example.test' },
+    ];
+    const fetchMock = vi.fn((path: string) => Promise.resolve(json(path === '/admin/api/overview' ? { accounts: 7, ready: 3 } : { items, total: 7 })));
+    vi.stubGlobal('fetch', fetchMock);
+    history.replaceState(null, '', '/#accounts');
+    function LanguageSwitch() {
+      const { lang, setLang } = useI18n();
+      return <button onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}>Language</button>;
+    }
+    renderPage(<><LanguageSwitch /><AccountsPage /></>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    const row = (email: string) => screen.getByRole('row', { name: new RegExp(email) });
+    const card = (email: string) => screen.getAllByRole('article').find(item => item.textContent?.includes(email))!;
+    const waitingRow = row('waiting@example.test');
+    const badge = within(waitingRow).getByText('Paid quota exhausted');
+    expect(badge.className).toContain('amber');
+    expect(badge.className).not.toContain('emerald');
+    expect(within(waitingRow).getByText('Free models remain available')).toBeTruthy();
+    expect(within(waitingRow).getByText(`Recovers at ${formatTime(now + 10)}`)).toBeTruthy();
+    expect(within(card('waiting@example.test')).getByText('Paid quota exhausted')).toBeTruthy();
+    expect(within(card('waiting@example.test')).getByText('Free models remain available')).toBeTruthy();
+    expect(within(card('waiting@example.test')).getByText(`Recovers at ${formatTime(now + 10)}`)).toBeTruthy();
+    expect(within(row('disabled@example.test')).getByText('Disabled')).toBeTruthy();
+    expect(within(row('blocked@example.test')).getByText('blocked')).toBeTruthy();
+    expect(within(card('blocked@example.test')).getByText('blocked')).toBeTruthy();
+    expect(within(card('blocked@example.test')).queryByText('Free models remain available')).toBeNull();
+    for (const name of ['expired', 'zero', 'legacy']) expect(within(row(`${name}@example.test`)).getByText('ok')).toBeTruthy();
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/admin/api/accounts?offset=0&limit=20');
+    expect(location.hash).toBe('#accounts');
+    fireEvent.click(screen.getByRole('button', { name: 'Language' }));
+    expect(within(waitingRow).getByText('付费额度耗尽')).toBeTruthy();
+    expect(within(waitingRow).getByText('免费模型仍可用')).toBeTruthy();
+    expect(within(waitingRow).getByText(`恢复时间 ${formatTime(now + 10)}`)).toBeTruthy();
+    expect(within(card('waiting@example.test')).getByText('付费额度耗尽')).toBeTruthy();
+    expect(within(card('waiting@example.test')).getByText('免费模型仍可用')).toBeTruthy();
+    expect(within(card('waiting@example.test')).getByText(`恢复时间 ${formatTime(now + 10)}`)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Language' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_990); });
+    expect(within(row('waiting@example.test')).getByText('ok').className).toContain('emerald');
+    expect(within(card('waiting@example.test')).queryByText('Paid quota exhausted')).toBeNull();
+    expect(within(card('waiting@example.test')).queryByText('Free models remain available')).toBeNull();
+    expect(within(row('failure@example.test')).getByText('Paid quota exhausted')).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(within(row('failure@example.test')).getByText('error')).toBeTruthy();
+  });
+
   it('restores hash filters, sends pagination and sorting to the server, and persists page size', async () => {
     history.replaceState(null, '', '/#accounts?group=team&status=ok&page=2');
-    const fetchMock = vi.fn(() => Promise.resolve(json({ items: [account], total: 200 })));
+    const fetchMock = vi.fn(() => Promise.resolve(json({ items: [{ ...account, quota_until: Math.floor(Date.now() / 1000) + 3600 }], total: 200 })));
     vi.stubGlobal('fetch', fetchMock);
     const view = renderPage(<AccountsPage />);
     expect(await screen.findAllByText('ada@example.test')).toHaveLength(2);
+    expect(screen.getAllByText('Paid quota exhausted')).toHaveLength(2);
     expect(String(fetchMock.mock.calls[0][0])).toBe('/admin/api/accounts?offset=40&limit=20&group=team&status=ok');
     expect((screen.getByLabelText('Group') as HTMLInputElement).value).toBe('team');
     expect((screen.getByLabelText('Status') as HTMLSelectElement).value).toBe('ok');

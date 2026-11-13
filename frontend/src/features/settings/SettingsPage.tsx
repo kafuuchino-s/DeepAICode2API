@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'rea
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronRight, RotateCcw } from 'lucide-react';
 import { api } from '../../lib/api';
+import { ConfirmDialog } from '../../components/ui/confirm-dialog';
 import { useI18n } from '../../lib/i18n';
 import { buildSettingsPatch, settingsToDraft, type Settings, type SettingsDraft, type SettingsPatch } from './settings-utils';
 
@@ -36,6 +37,12 @@ function SettingsForm({ initial }: { initial: Settings }) {
   const [problem, setProblem] = useState<'aliases' | 'number' | 'password' | 'storage' | null>(null);
   const [saved, setSaved] = useState(false);
   const [resetDone, setResetDone] = useState(false);
+  const [confirmation, setConfirmation] = useState<{ kind: 'password'; patch: SettingsPatch } | { kind: 'reset' } | null>(null);
+  const returnFocus = useRef<HTMLElement | null>(null);
+  const confirm = (value: NonNullable<typeof confirmation>) => {
+    returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setConfirmation(value);
+  };
   useEffect(() => {
     if (!dirty.current) {
       setDraft(settingsToDraft(initial));
@@ -71,14 +78,18 @@ function SettingsForm({ initial }: { initial: Settings }) {
       if (result.error === 'aliases') setSection('aliases');
       else {
         const positive = [draft.request_timeout_sec, draft.max_retries, draft.log_keep];
-        setSection(positive.some(value => !value.trim() || !Number.isInteger(Number(value)) || Number(value) < 1) ? 'runtime' : 'limits');
+        const checkin = Number(draft.checkin_block_ms);
+        setSection(positive.some(value => !value.trim() || !Number.isInteger(Number(value)) || Number(value) < 1) || !draft.checkin_block_ms.trim() || !Number.isSafeInteger(checkin) || checkin < 0 ? 'runtime' : 'limits');
       }
       return;
     }
     if ((password || passwordConfirm) && (!password.trim() || password !== passwordConfirm)) { setProblem('password'); setSection('password'); return; }
+    if (initial.checkin_block_ms === undefined) delete result.patch.checkin_block_ms;
+    if (initial.preset_desktop_shape === undefined) delete result.patch.preset_desktop_shape;
     if (password) {
-      if (!window.confirm(t('确定修改管理口令？新口令将用于此标签页的后续请求。', 'Change the admin password? This tab will use the new password for subsequent requests.'))) return;
       result.patch.admin_password = password.trim();
+      confirm({ kind: 'password', patch: result.patch });
+      return;
     }
     save.mutate(result.patch);
   };
@@ -91,7 +102,7 @@ function SettingsForm({ initial }: { initial: Settings }) {
   return <div className="space-y-6">
     <div className="flex items-center justify-between gap-4"><h1 className="text-xl font-normal tracking-tight">{t('设置', 'Settings')}</h1><button className={`${buttonClass} bg-primary text-primary-foreground hover:bg-primary/90`} type="submit" form="settings-form" disabled={save.isPending}>{save.isPending ? t('保存中…', 'Saving…') : t('保存设置', 'Save settings')}</button></div>
     {error && <p role="alert" className="rounded-lg bg-destructive/5 p-3 text-sm text-destructive">{t('操作失败：', 'Request failed: ')}{error instanceof Error ? error.message : String(error)}</p>}
-    {problem && <p role="alert" className="rounded-lg bg-destructive/5 p-3 text-sm text-destructive">{problem === 'aliases' ? t('模型别名必须是 JSON 对象，且每个目标必须是字符串。', 'Model aliases must be a JSON object with string values.') : problem === 'number' ? t('请检查数值：超时、重试和日志保留必须是大于零的整数；限流参数不能为负。', 'Check numeric values: timeout, retries and log retention must be positive integers; rate limits cannot be negative.') : problem === 'password' ? t('请输入非空的新口令，并确保两次输入一致。', 'Enter a non-empty password and make sure both entries match.') : t('设置已保存，但此标签页无法保存新口令；请使用新口令重新登录。', 'Settings were saved, but this tab could not store the new password. Please sign in again with the new password.')}</p>}
+    {problem && <p role="alert" className="rounded-lg bg-destructive/5 p-3 text-sm text-destructive">{problem === 'aliases' ? t('模型别名必须是 JSON 对象，且每个目标必须是字符串。', 'Model aliases must be a JSON object with string values.') : problem === 'number' ? t('请检查数值：超时、重试和日志保留必须是大于零的整数；签到等待和限流参数不能为负。', 'Check numeric values: timeout, retries and log retention must be positive integers; check-in wait and rate limits cannot be negative.') : problem === 'password' ? t('请输入非空的新口令，并确保两次输入一致。', 'Enter a non-empty password and make sure both entries match.') : t('设置已保存，但此标签页无法保存新口令；请使用新口令重新登录。', 'Settings were saved, but this tab could not store the new password. Please sign in again with the new password.')}</p>}
     {saved && <p role="status" className="rounded-lg bg-muted/70 p-3 text-sm">{t('设置已保存。', 'Settings saved.')}</p>}
     {resetDone && <p role="status" className="rounded-lg bg-muted/70 p-3 text-sm">{t('统计已重置，日志保留。', 'Statistics reset; logs were retained.')}</p>}
     <div className="flex min-w-0 flex-col gap-8 lg:flex-row lg:gap-7">
@@ -101,6 +112,8 @@ function SettingsForm({ initial }: { initial: Settings }) {
           <Field label={t('请求超时（秒）', 'Request timeout (seconds)')} hint={t('等待上游请求完成的最长时间。', 'Maximum time to wait for an upstream request.')}><input className={inputClass} type="number" min="1" step="1" required value={draft.request_timeout_sec} onChange={e => update('request_timeout_sec', e.target.value)} /></Field>
           <Field label={t('最大重试次数', 'Maximum retries')} hint={t('请求失败时允许的最大重试次数。', 'Maximum retry attempts after a request fails.')}><input className={inputClass} type="number" min="1" step="1" required value={draft.max_retries} onChange={e => update('max_retries', e.target.value)} /></Field>
           <Field label={t('日志保留条数', 'Log retention count')} hint={t('内存中保留的最近请求条数。', 'Recent requests retained in memory.')}><input className={inputClass} type="number" min="1" step="1" required value={draft.log_keep} onChange={e => update('log_keep', e.target.value)} /></Field>
+          <Field label={t('签到等待上限（毫秒）', 'Check-in wait limit (ms)')} hint={initial.checkin_block_ms === undefined ? t('当前服务版本不支持此设置。', 'This server version does not support this setting.') : t('非负整数；0 使用默认的 10 秒。', 'Non-negative integer; 0 uses the default of 10 seconds.')}><input className={inputClass} type="number" min="0" step="1" value={draft.checkin_block_ms} disabled={initial.checkin_block_ms === undefined} onChange={e => update('checkin_block_ms', e.target.value)} /></Field>
+          <Field label={t('预置桌面端请求形状', 'Preset desktop request shape')} hint={initial.preset_desktop_shape === undefined ? t('当前服务版本不支持此设置。', 'This server version does not support this setting.') : t('仅对已遇过形状拒绝的密钥，为缺少系统消息的请求预置系统消息；默认关闭。', 'For keys that have encountered a shape rejection, add a system message to requests that lack one. Off by default.')}><span><input type="checkbox" className="size-4 accent-current" checked={draft.preset_desktop_shape} disabled={initial.preset_desktop_shape === undefined} onChange={e => update('preset_desktop_shape', e.target.checked)} /></span></Field>
           <Field label={t('CORS 允许来源', 'Allowed CORS origins')} hint={t('多个来源用逗号分隔；留空时只允许本机来源。', 'Separate origins with commas; leave blank to allow local origins only.')}><input className={inputClass} value={draft.cors_origin} onChange={e => update('cors_origin', e.target.value)} placeholder="http://192.168.1.10:8080" /></Field>
           <Field label={t('兜底模型', 'Fallback model')} hint={t('留空时使用目录默认模型。', 'Leave blank to use the catalog default.')}><input className={inputClass} value={draft.fallback_model} onChange={e => update('fallback_model', e.target.value)} placeholder="glm-5.3-flash" /></Field>
           <Field label={t('严格模型模式', 'Strict model mode')} hint={t('未识别的模型名返回 404，不做静默回落。', 'Return 404 for unknown models instead of silently falling back.')}><span><input type="checkbox" className="size-4 accent-current" checked={draft.strict_model} onChange={e => update('strict_model', e.target.checked)} /></span></Field>
@@ -112,9 +125,14 @@ function SettingsForm({ initial }: { initial: Settings }) {
         </div></section>
         <section hidden={section !== 'aliases'} aria-label={t('模型别名', 'Model aliases')} className="space-y-8"><h2 className="text-base font-medium">{t('模型别名', 'Model aliases')}</h2><Field label={t('别名映射', 'Alias mapping')} hint={t('用 JSON 将客户端模型名映射到目录模型 ID，也可在模型页逐条编辑。', 'Map client model names to catalog IDs as JSON, or edit them individually on the Models page.')}><textarea className="min-h-36 w-full rounded-lg border border-transparent bg-muted/70 px-3 py-2 font-mono text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary" spellCheck={false} value={draft.aliases} onChange={e => update('aliases', e.target.value)} /></Field><p className="text-xs text-muted-foreground">{'{"claude-sonnet-4": "glm-5.3-flash"}'}</p></section>
         <section hidden={section !== 'password'} aria-label={t('管理口令', 'Admin password')} className="space-y-8"><div><h2 className="text-base font-medium">{t('管理口令', 'Admin password')}</h2><p className="mt-2 text-sm text-muted-foreground">{passwordSet ? t('已设置口令。留空则保持不变。', 'A password is set. Leave blank to keep it unchanged.') : t('尚未设置口令。留空则保持不变。', 'No password is set. Leave blank to keep it unchanged.')}</p><p className="mt-2 text-sm text-muted-foreground">{t('如果启动时通过环境变量或参数设置了管理口令，重启后会以启动配置为准。', 'If the admin password is set by an environment variable or startup argument, the startup setting takes precedence after a restart.')}</p></div><div className="space-y-7"><Field label={t('新口令', 'New password')} hint={t('保存时会去掉首尾空格。', 'Leading and trailing whitespace is removed when saved.')}><input className={inputClass} type="password" autoComplete="new-password" value={password} onChange={e => { dirty.current = true; setPassword(e.target.value); setSaved(false); }} /></Field><Field label={t('确认新口令', 'Confirm new password')}><input className={inputClass} type="password" autoComplete="new-password" value={passwordConfirm} onChange={e => { dirty.current = true; setPasswordConfirm(e.target.value); setSaved(false); }} /></Field></div></section>
-        <section hidden={section !== 'stats'} aria-label={t('统计管理', 'Statistics')} className="space-y-8"><h2 className="text-base font-medium">{t('统计管理', 'Statistics')}</h2><div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(13rem,17rem)] md:items-center md:gap-8"><div><h3 className="text-sm text-muted-foreground">{t('重置统计', 'Reset statistics')}</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">{t('清除累计和今日统计，保留请求日志。', 'Clear cumulative and daily statistics while retaining request logs.')}</p></div><div><button className={`${buttonClass} text-destructive`} type="button" disabled={reset.isPending} onClick={() => { setResetDone(false); if (window.confirm(t('确定重置统计？累计与今日统计将清零，日志不会被删除。', 'Reset statistics? Cumulative and daily counters will be cleared; logs will be retained.'))) reset.mutate(); }}><RotateCcw className="size-4" aria-hidden="true" />{t('重置统计', 'Reset statistics')}</button></div></div></section>
+        <section hidden={section !== 'stats'} aria-label={t('统计管理', 'Statistics')} className="space-y-8"><h2 className="text-base font-medium">{t('统计管理', 'Statistics')}</h2><div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(13rem,17rem)] md:items-center md:gap-8"><div><h3 className="text-sm text-muted-foreground">{t('重置统计', 'Reset statistics')}</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">{t('清除累计和今日统计，保留请求日志。', 'Clear cumulative and daily statistics while retaining request logs.')}</p></div><div><button className={`${buttonClass} text-destructive`} type="button" disabled={reset.isPending} onClick={() => { setResetDone(false); confirm({ kind: 'reset' }); }}><RotateCcw className="size-4" aria-hidden="true" />{t('重置统计', 'Reset statistics')}</button></div></div></section>
       </form>
     </div>
+    <ConfirmDialog open={confirmation !== null} onOpenChange={open => { if (!open) setConfirmation(null); }} returnFocus={returnFocus}
+      title={confirmation?.kind === 'reset' ? t('重置统计', 'Reset statistics') : t('修改管理口令', 'Change admin password')}
+      description={confirmation?.kind === 'reset' ? t('累计与今日统计将清零，日志不会被删除。', 'Cumulative and daily counters will be cleared; logs will be retained.') : t('新口令将用于此标签页的后续请求。', 'This tab will use the new password for subsequent requests.')}
+      confirmLabel={confirmation?.kind === 'reset' ? t('重置统计', 'Reset statistics') : t('修改口令', 'Change password')}
+      onConfirm={() => { if (confirmation?.kind === 'reset') reset.mutate(); else if (confirmation?.kind === 'password') save.mutate(confirmation.patch); }} />
   </div>;
 }
 

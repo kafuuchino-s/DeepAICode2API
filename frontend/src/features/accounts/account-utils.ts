@@ -12,6 +12,7 @@ export interface Account {
   enabled: boolean;
   status?: string;
   failures?: number;
+  quota_until?: number;
   last_used?: number;
   last_err?: string;
   proxy?: string;

@@ -329,22 +329,33 @@ func (s *Store) RemoveAccount(id string) bool {
 // 返回值第二个标记“池里是否有可调度账号（忽略 skip）”，
 // 供调用方区分“全忙”与“根本没号”。
 func (s *Store) PickAccount(group string, skip func(*deepai.Account) bool) (*deepai.Account, bool) {
+	return s.PickAccountForQuota(group, skip, false)
+}
+
+// PickAccountForQuota 为免费或价格未知的模型保留已耗尽付费额度的账号。
+func (s *Store) PickAccountForQuota(group string, skip func(*deepai.Account) bool, allowExhausted bool) (*deepai.Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	acct := s.sched.PickFiltered(s.st.Accounts, group, skip)
+	acct := s.sched.PickFilteredForQuota(s.st.Accounts, group, skip, allowExhausted)
 	if acct == nil {
-		return nil, s.sched.HasEligible(s.st.Accounts, group)
+		return nil, s.sched.HasEligibleForQuota(s.st.Accounts, group, allowExhausted)
 	}
 	return acct.Clone(), true
 }
 
-// AnySchedulable 报告是否存在满足 ok 的可调度账号（启用、未被拦截），
+// AnySchedulable 报告是否存在满足 ok 的可调度账号（启用、未被拦截且不在额度恢复期），
 // 不解包快照、不深拷贝。
 func (s *Store) AnySchedulable(ok func(*deepai.Account) bool) bool {
+	return s.AnySchedulableForQuota(ok, false)
+}
+
+// AnySchedulableForQuota 与 PickAccountForQuota 采用一致的额度规则。
+func (s *Store) AnySchedulableForQuota(ok func(*deepai.Account) bool, allowExhausted bool) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := time.Now().Unix()
 	for _, a := range s.st.Accounts {
-		if a == nil || !a.Enabled || a.Status == deepai.StatusBlocked {
+		if a == nil || !a.Enabled || a.Status == deepai.StatusBlocked || (!allowExhausted && a.QuotaUntil > 0 && now < a.QuotaUntil) {
 			continue
 		}
 		if ok == nil || ok(a) {
@@ -370,7 +381,12 @@ func (s *Store) NextAccountGroup(group string) *deepai.Account {
 // 失败时是否把账号标成 error 由瞬时判定决定（见 MarkAccountFailure）：
 // 这个入口保留给“已经确定要记成失败”的调用方（例如不带错误对象的场合）。
 func (s *Store) MarkAccountResult(id string, ok bool, note string) {
-	s.markAccountResult(id, ok, note, false)
+	s.markAccountResult(id, ok, note, false, false)
+}
+
+// MarkAccountSuccess 保留免费或价格未知模型请求不能证明已恢复的付费额度标记。
+func (s *Store) MarkAccountSuccess(id string, preserveQuota bool) {
+	s.markAccountResult(id, true, "", false, preserveQuota)
 }
 
 // MarkAccountFailure 记录一次带错误对象的失败。
@@ -388,10 +404,10 @@ func (s *Store) MarkAccountFailure(id string, err error) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
-	s.markAccountResult(id, false, err.Error(), deepai.Transient(err))
+	s.markAccountResult(id, false, err.Error(), deepai.Transient(err), false)
 }
 
-func (s *Store) markAccountResult(id string, ok bool, note string, transient bool) {
+func (s *Store) markAccountResult(id string, ok bool, note string, transient, preserveQuota bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range s.st.Accounts {
@@ -405,6 +421,10 @@ func (s *Store) markAccountResult(id string, ok bool, note string, transient boo
 			a.Status = "ok"
 			a.LastErr = ""
 			a.LastErrAt = 0
+			// 免费模型成功不能证明付费额度已恢复。
+			if !preserveQuota {
+				a.QuotaUntil = 0
+			}
 			// 注意：不在这里清 ProbeAfter —— 推理成功不等于 /theos 会成功。
 			// 签到限流的账号正是“能推理、不能签到”，清掉冷却会让后台守护
 			// 每分钟又去磕一次 403。探测成功后由 SetAccountAllowance 清零。
@@ -465,6 +485,36 @@ func (s *Store) BlockAccount(id, reason string) {
 			a.Failures = 1
 		}
 		return
+	}
+}
+
+// MarkQuotaExhausted 标记账号「当日额度用完」，until 之前调度跳过它。
+//
+// 与 BlockAccount 的区别：这是自愈状态（到点自动恢复），不需要人工处理，
+// 也不该让控制台把它显示成「被策略拦截」。
+func (s *Store) MarkQuotaExhausted(id string, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.st.Accounts {
+		if a.ID != id {
+			continue
+		}
+		a.QuotaUntil = until.Unix()
+		a.LastErr = "当日额度用完（" + until.Format(time.RFC3339) + " 恢复）"
+		a.LastErrAt = time.Now().Unix()
+		return
+	}
+}
+
+// ClearQuotaExhausted 清除额度用完标记（探测到余额恢复时调用）。
+func (s *Store) ClearQuotaExhausted(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.st.Accounts {
+		if a.ID == id {
+			a.QuotaUntil = 0
+			return
+		}
 	}
 }
 

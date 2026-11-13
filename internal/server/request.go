@@ -31,11 +31,6 @@ func affinityFor(r *http.Request, payload map[string]any) string {
 	return ""
 }
 
-// nonStreamBudget 是非流式请求的整体预算（选号 + 重试 + 读体）。
-//
-// 没有它时，「MaxRetries × Retry-After≤30s」理论上可挂 90s 以上。
-const nonStreamBudget = 90 * time.Second
-
 // readBodyWithLimit 读取入站请求体。
 func readBodyWithLimit(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	return io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
@@ -114,6 +109,9 @@ func (s *Server) clientFor(acct *deepai.Account) *deepai.Client {
 		return c
 	}
 	c := deepai.NewClientWithProxy(acct.Proxy)
+	if budget := time.Duration(s.Store.Settings().CheckinBlockMS) * time.Millisecond; budget > 0 {
+		c.SetCheckInBudget(budget)
+	}
 	s.proxyClients[acct.Proxy] = c
 	return c
 }

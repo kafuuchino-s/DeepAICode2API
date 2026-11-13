@@ -15,14 +15,15 @@ import (
 // start/inLen/outLen/usage/err），二十余处调用完全靠记忆参数顺序，
 // 写错编译器也不报错。现在把不变量在构造时固化，调用点只补变化的部分。
 type reqLog struct {
-	s        *Server
-	key      string
-	acct     *deepai.Account
-	model    string
-	endpoint string
-	stream   bool
-	start    time.Time
-	inLen    int
+	s              *Server
+	key            string
+	acct           *deepai.Account
+	model          string
+	endpoint       string
+	stream         bool
+	allowExhausted bool
+	start          time.Time
+	inLen          int
 
 	// state 是「是否已记录」的共享标记。reqLog 是值类型（各 handler 按值传递），
 	// 所以标记必须放在指针后面：done 可能被不同分支各调一次，只有第一次生效
@@ -114,3 +115,9 @@ func (l reqLog) doneStatus(status int, outLen int, usage Usage, err error) {
 	}
 	l.s.Store.Record(e, outLen)
 }
+
+// apiKey 返回本次请求的调用密钥。
+//
+// 只供形状记忆 / 指标这类进程内逻辑使用；日志与统计落盘走 key 的脱敏视图，
+// 不要把完整密钥写进日志。
+func (l reqLog) apiKey() string { return l.key }

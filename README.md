@@ -26,7 +26,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 双协议 | OpenAI `/v1/chat/completions`、`/v1/responses`；Anthropic `/v1/messages` |
-| 协议对齐 | 车道 4 + `X-DeepAI-Code-Instance` + `/theos` 签到；区分 `social_login_required` / `machine_required` / `lane_version_unsupported` |
+| 协议对齐 | 车道 5 + `X-DeepAI-Code-Instance` + `/theos` 签到；区分 `social_login_required` / `machine_required` / `lane_version_unsupported` |
 | 号池治理 | 分组轮询、失败换号、容量退避、按账号配额调度、策略拦截自动跳过 |
 | 账号接入 | 浏览器登录（Google / Apple / 邮箱密码）、桌面端凭据导入、手工 API Key；入池自动分配机器指纹与代理 |
 | 控制台 | 单页内嵌 UI：账号 / 密钥 / 日志 / 统计 / 设置 |
@@ -49,8 +49,9 @@
 
 ## 一、逆向结论
 
-DeepAI Code 是 **Electron + 本地 t3code server** 架构（应用版本 **0.3.35**，车道 4；
-0.3.20 → 0.3.30 → 0.3.32 → 0.3.35 的 wire protocol 逐项比对**未变**）。
+DeepAI Code 是 **Electron + 本地 t3code server** 架构（应用版本 **0.3.36**，车道 5；
+0.3.20 → 0.3.30 → 0.3.32 → 0.3.35 → 0.3.36 的 wire protocol 逐项比对：
+**0.3.36 只抬了车道（4 → 5），其余请求头 / 指纹 / 签到 / 端点未变**）。
 真正干活的不是桌面壳，而是 `resources/server.asar` 里的 t3code server；
 它把上游能力封装成本地回环 HTTP 服务，再交给 Pi（编码 agent）调用。
 
@@ -70,11 +71,11 @@ DeepAI Code 是 **Electron + 本地 t3code server** 架构（应用版本 **0.3.
 | 语音转写 | `POST https://api.deepai.org/speech_to_text`（字段 `voiceRecording`） |
 | 联网搜索 | `POST https://api.deepai.org/deepai_code/web_search` |
 | **鉴权** | 请求头 `Api-Key: <apiKey>`（不是 `Authorization`） |
-| 协议头 | `X-DeepAI-Code-Theos: 4`（计费车道版本；推理端点 2/3/5 一律 426，`/models` `/theos` 自 2026-11-11 起放宽到 1–4，见 `docs/recon.md` §3） |
+| 协议头 | `X-DeepAI-Code-Theos: 5`（计费车道版本；0.3.36 起为 5，推理端点 4 / 5 都接受，`/models` 放宽到 1–5，见 `docs/recon.md` §3） |
 | 进程实例 | `X-DeepAI-Code-Instance: <32 位 hex>`（每个出口代理随机一次，随该代理的所有 JSON 请求发出；桌面端是每进程一次） |
 | 签到 | `/theos` 响应带 `check_in:{nonce, seconds}`；下次 `/theos` 回传 `X-DeepAI-Code-Check-In` 与 `X-DeepAI-Code-Beacon: v=…;up=…;pi=0\|1`（`focus` 只在焦点状态已知时才追加） |
 | **机器指纹** | `X-DeepAI-Code-Machine: sha256(原始机器 UUID)`，用于按天发放免费 Theos；计量模型缺失时回 `machine_required` |
-| 会话粘性 | `X-Session-Affinity`（body 里的 `prompt_cache_key` 也会被上游使用） |
+| 会话标识 | `X-Session-Affinity`（body 里的 `prompt_cache_key` 也会传给上游）；网关仍按账号池调度，不保证固定账号或缓存命中 |
 | 容量拒绝 | `409 {"error":{"code":"session_busy"}}` + `Retry-After` |
 | 账号策略 | `403 social_login_required`：0.3.19 的阶段性收窄，2026-11-09 复测已解除；网关仍按 `blocked` 终态处理（见 `docs/recon.md` §4.1） |
 | 浏览器登录 | `GET /deepai_code/desktop_auth/?state=…&port=…` → 本机 `/auth-callback?code=…` → `POST /deepai_code/desktop_auth/exchange/` |
@@ -114,15 +115,15 @@ OpenRouter 风格的 `provider`、`reasoning`、`reasoning_details`、`cost` 等
 ## 二、支持的模型
 
 模型目录**完全由上游下发**：网关只做缓存与别名，上游新增或下线模型都无需改代码。
-下表是 2026-11-10 从线上网关的 `/v1/models` 导出的**实时目录**（22 个：11 免费 / 11 付费），
-`Theos/次` 取自上游 `theosPerRequest`，`0` 即免费。控制台「模型目录」页读的是同一份数据。
+下表是 2026-11-13 从线上 `/v1/models` 导出的**实时目录**（21 个：10 免费 / 11 付费），
+`Theos/次` 取自上游 `theosPerRequest`（字符串），`0` 即免费。控制台「模型目录」页读的是同一份数据。
+（上一版快照里的 `crouton-alpha` 已被上游下线；`gpt-oss-120b` 客户端会主动过滤，网关也不展示。）
 
 | ID | 名称 | 上下文 | 最大输出 | Theos/次 | 说明 |
 | --- | --- | ---: | ---: | ---: | --- |
 | `glm-5.3-flash` | GLM 5.3 Flash | 1,048,576 | 131,072 | **0** | 默认模型，免费 |
-| `crouton-alpha` | Crouton Alpha | 1,048,576 | 131,072 | **0** | 免费 |
 | `deepai-cyber` | DeepAI Cyber | 1,048,576 | 131,072 | **0** | 免费，纯文本 |
-| `deepseek-v4.1-flash` | DeepSeek V4.1 Flash | 1,048,576 | 131,072 | **0** | 免费 |
+| `deepseek-v4.1-flash` | DeepSeek V4.1 Flash 1017 | 1,048,576 | 131,072 | **0** | 免费（上游下拉是 `DeepSeek V4.1 Flash 1017`，桌面端会把旧名改写成它） |
 | `glyph-cluster` | Glyph Cluster | 256,000 | 131,072 | **0** | 免费，纯文本 |
 | `gpt-6-luna` | GPT-6 Luna | 1,048,576 | 128,000 | **0** | 免费 |
 | `mimo-2.6-flash` | MiMo 2.6 Flash | 1,048,576 | 131,072 | **0** | 免费 |
@@ -144,7 +145,7 @@ OpenRouter 风格的 `provider`、`reasoning`、`reasoning_details`、`cost` 等
 
 说明：
 
-- 只有 `deepai-cyber` / `glm-5.3` / `glyph-cluster` / `solar-mini-4` 是纯文本
+- 只有 `deepai-cyber` / `glm-5.3` / `glyph-cluster` / `solar-mini-4` / `minimax-m3` 是纯文本
   （`input: [text]`），其余都接受图片输入（`input: [text, image]`）；全部支持推理（`reasoning`）；
 - `gpt-6-astra` 的 `api` 是 `openai-responses`，必须走 `/v1/responses`，
   用 `/v1/chat/completions` 调用会被上游拒绝；
@@ -221,7 +222,7 @@ export ANTHROPIC_MODEL=glm-5.3-flash
 | `/` | 内嵌单页控制台（无外部依赖） |
 | `/ping` | `pong` |
 | `/health` | 账号 / 模型 / 机器指纹摘要；`ready` / `degraded` / `blocked` 三个计数（口径见 §6.4 末段） |
-| `/metrics` | Prometheus 文本格式指标（与 `/admin/api/*` 同级鉴权）：请求量/状态码分类、耗时 sum+count、在途请求、号池分布、goroutine/堆 |
+| `/metrics` | Prometheus 文本格式指标（与 `/admin/api/*` 同级鉴权）：请求量/状态码分类、**分端点延迟直方图**、**签到耗时/阻塞/超时**、**上游错误码分布**、**形状兜底次数**、在途请求、号池分布、goroutine/堆 |
 | `/admin/api/version` | 当前版本 + 最新 release 比对（服务端代查 GitHub，缓存 6h；离线时只回当前版本，不影响控制台） |
 | `/admin/api/stats?trend=days&days=30` | 按 UTC 日期返回请求、用量和上报覆盖情况；`days` 默认为 30，范围为 1–365 |
 | `/admin/api/*` | 账号、密钥、日志、统计、设置、配额、登录 |
@@ -617,8 +618,9 @@ docker run -d --name deepaicode2api \
   deepaicode2api
 ```
 
-> `X-DeepAI-Code-Theos: 4` 是**推理**的硬门槛：2/3/5 在 `/chat/completions` 上返回
-> `426 lane_version_unsupported`（`/models` `/theos` 已放宽到 1–4，见 `docs/recon.md` §3）。
+> `X-DeepAI-Code-Theos: 5` 是当前客户端（0.3.36）的车道：`/chat/completions` 上
+> 4 / 5 都回 200，更旧的 2/3 与更高的 6+ 回 `426 lane_version_unsupported`
+> （`/models` 放宽到 1–5，见 `docs/recon.md` §3）。
 > `X-DeepAI-Code-Machine` 仍是计量模型的必需头：缺失时返回 `400 machine_required`。
 > 容器里通常读不到宿主机的 SMBIOS UUID，因此 `DEEPAI_MACHINE_ID` 在容器部署时**必填**。
 > 填桌面端所在机器的原始 UUID 即可复用同一份每日免费额度。
@@ -661,25 +663,34 @@ go build -ldflags "-X main.version=v0.1.2" -o bin/deepaicode2api .
   VERSION=v0.1.2+fork docker compose up -d --build
   # 仓库已打版本标签时也可用 VERSION=$(git describe --tags)
   ```
-- 发版流程：`git tag v0.1.2 && git push origin v0.1.2`，再用
-  `sh scripts/release.sh v0.1.2 --publish` 交叉编译各平台二进制并创建 GitHub Release
-  （构建前先 `rm -rf dist`：脚本按版本号命名产物，旧版本文件会被一起上传）。
+- 发版流程：`git tag v0.1.3 && git push origin v0.1.3`，再用
+  `sh scripts/release.sh v0.1.3 --publish` 交叉编译各平台二进制并创建 GitHub Release
+  （脚本构建前会清掉 `dist/` 里上一版的 `deepaicode2api_*` 产物：`gh release upload`
+  传的是 `dist/*`，残留的旧二进制会被一起传上去）。
 
 ## 十、限制与说明
 
-- `X-DeepAI-Code-Theos` 必须发 `4`（0.3.19 起至今未变，0.3.30 / 0.3.32 / 0.3.35 复核仍为 4）；推理端点车道不符返回 426 `lane_version_unsupported`（元数据端点 1–4 都接受，别用它判断上游可用性）；
-- 心跳 `X-DeepAI-Code-Beacon` 的 `v=` 必须是当前客户端版本（现为 **0.3.35**，见 `deepai.AppVersion`）；`pi=` 在 0.3.30 起是可选的，但发了不会错；
-- 推理请求按桌面端实测值发 `user-agent: node` + `accept: */*`，**不带** Chrome UA / `sec-ch-ua` / `Accept-Language`（推理侧只发桌面端请求头）；
+- 默认 `X-DeepAI-Code-Theos: 5`（0.3.36 起；2026-11-13 复核推理端点接受 4 / 5，元数据端点接受 1–5，别用 `/models` 判断上游推理可用性）；推理端点车道不符返回 426 `lane_version_unsupported`；
+- 心跳 `X-DeepAI-Code-Beacon` 的 `v=` 必须是当前客户端版本（现为 **0.3.36**，见 `deepai.AppVersion`）；`pi=` 在 0.3.30 起是可选的，但发了不会错；
+- 推理请求按桌面端实测值发 `user-agent: node`、`accept: */*`、`accept-language: *`，不带 Chrome UA 或 `sec-ch-ua` 指纹；
 - `X-DeepAI-Code-Machine` 缺失时计量模型返回 `machine_required`，因此无 SMBIOS 的环境必须设置 `DEEPAI_MACHINE_ID`；
 - 0.3.19 曾把推理收窄到 **Google/Apple 登录**的账号（邮箱密码号 `403
   social_login_required`）；**2026-11-09 复测已解除**，邮箱号恢复可用。
   网关仍把该错误码当策略终态（标记 `blocked`、停止调度），策略再次收紧时
   无需改代码；看到 `blocked` 时先看 `last_err` 是否仍是该码，再决定是否重新授权；
-- 上游免费额度按「机器指纹 + 账号」每天发放，额度耗尽后返回 403；
-  机器指纹**每个账号一份**（见 §6.4），共用时只有第一个账号能领到；
+- 上游每日免费 Theos 额度受出口 IP 影响，同一出口可能共享当日额度池，见 `docs/recon.md` §4；
+  当账号收到 `theos_exhausted` 时，恢复前不会再调度已知计量模型，但免费及未提供价格的模型仍可尝试。
+  控制台的就绪数按付费额度保守统计，免费模型实际可用的账号可能更多；
 - `gpt-6-astra` 等 `openai-responses` 模型必须走 `/v1/responses`；用
   `/v1/chat/completions` 调用会被上游拒绝（网关会原样回传错误）；
 - 语音转写上游只接受 `audio/webm` / `audio/mp4`，其他格式请先转码；
+- **不实现托管主机控制面** `/deepai_code/connect/*`（设备注册 / 远程主机 / TLS 中继）：
+  它要 Ed25519 + X25519 双密钥设备身份与受管主机生命周期，服务的是桌面端
+  「把机器变成受管主机」功能，与推理无关（逆向细节见 `docs/recon.md` §2.1）；
+- 模型目录与车道探测**刻意不带凭据**：网关的 `GET /deepai_code/models` 只发车道头 +
+  机器指纹（代理预热 / 车道探测都走它）。桌面端 0.3.36 会给 `/models` 带 `Api-Key`，
+  但目录不随账号变化（带/不带返回同一份），把密钥发到一个本来匿名就能用的
+  端点上没有收益（见 `docs/recon.md` §2）；
 - `/v1/messages/count_tokens` 是字符数估算，不是上游真实 tokenizer；
 - 状态文件默认明文保存上游 API Key（与桌面端一致）；配置
   `DEEPAI2API_MASTER_KEY` 后整文件加密，请务必保证主密钥不随备份泄露；
@@ -691,6 +702,18 @@ go build -ldflags "-X main.version=v0.1.2" -o bin/deepaicode2api .
 - **数据面限流默认关闭**：控制台「运行参数」可设 `rate_limit_rps`（每密钥每秒请求数）、
   `rate_limit_burst`（桶容量）、`key_concurrency`（每密钥并发上限），填 0 即不限。
   限流按密钥隔离，触发时回 `429` + `Retry-After` + `rate_limit_error`；
+- **推理超时**：非流式请求的选号、重试和读体受 `request_timeout_sec` 整体限制
+  （默认 600 秒）。非流式每次上游请求从发起到首个响应字节最多等待 300 秒，包含响应头；
+  流式首字节及首字节后的空闲间隔为 120 秒。调用方取消或较短的整体超时会提前结束请求；
+- **签到预算**（`checkin_block_ms`，默认 10000）：推理前同步签到最多等多久。
+  2026-11-13 线上实测签到阻塞 292 次、均值 4.8s、53 次顶到 10s，是首包延迟的
+  主要来源；下调到 2000 可显著改善延迟（代价：这次请求可能带着旧 nonce 发出，
+  下一轮继续补，不会失败）；
+- **预置桌面端形状**（`preset_desktop_shape`，默认关）：对已确认需要桌面端形状的
+  调用方（按 API Key 记忆 10 分钟），在首次发送前补 system 消息，省掉一次注定
+  失败的 400。关闭时仍走「透传 → 400 → 补形状重试」的学习路径；
+- **签到节奏**与桌面端一致（以回传完成时刻为基准，`seconds/2` 默认 300s）；
+  之前用「最新 nonce ≠ 已回传 nonce」判断，会退化成 30s 一次（见 `docs/changes.md` §60）；
 - **管理口令有防爆破退避**：同一来源连续失败 5 次后进入指数退避（1s 起，上限 30s），
   退避期内即使口令正确也回 `429`；成功一次即清零。若把自己锁在外面，等退避到期
   或重启进程（退避表在内存里）即可；
@@ -704,10 +727,11 @@ go build -ldflags "-X main.version=v0.1.2" -o bin/deepaicode2api .
 | 现象 | 原因 | 不要“修”成什么样 |
 | --- | --- | --- |
 | 无效 Key 返回 200 且是 HTML | 上游 302 到登录页 | 不要 `CheckRedirect` 跟随；`ErrUseLastResponse` 是刻意的 |
-| 换用别的 UA 后「模型变了」 | 上游按 `User-Agent` 分流：非 `node` 的 UA 会被换到另一个后端，但响应 `model` 仍写原名 | 不要“优化”成浏览器 UA；推理必须发 `user-agent: node`（见 `docs/recon.md` §3.1） |
-| 响应里缺 `provider` / `model` 回 `reflection/beam` | 说明这次请求落在了被替换的后端（替身现在**不发 `provider`**，改用 stealth slug 冒充） | 判据：**`provider` 缺失 + `model` 不回显请求 slug + `id` 以 `gen_` 开头**（见 `docs/recon.md` §3.1）；别再找 `provider: DeepAI`，它已经不存在了 |
+| 换用别的 UA 后「模型变了」 | **2026-11-13 复测已无 UA 分流**（`node` / `curl` / Chrome 响应形状一致）；历史原因见 `docs/recon.md` §3.1 | 不要按旧结论给号池“修”UA；网关继续发 `user-agent: node` 只是与桌面端一致 |
+| 响应里缺 `provider` | **已经不能当判据**：2026-11-13 起真实请求也不再发 `provider` / `service_tier` / `cost_details`，`id` 统一 `gen-<32 hex>`，`model` 回 `zai/<slug>` | 别再按 `provider` / `gen_` / cost 判替身（见 `docs/recon.md` §3.1；要验号用模型指纹） |
 | 号池「指纹突然变差」 | 没完成签到：只拉 `/theos` 不回传 nonce 等于没签到，会落到替身分支 | 等一轮 `EnsureCheckIn` 续签即可；换机器指纹会重新变成冷状态 |
 | `403 check_in_refused` | 当天「重启签到」次数用尽（`restarted its check-in too many times today`） | 不要重试、不要把账号标 error：推理仍可用，明天自动恢复；也别再跑签到体检 |
+| `400 This request cannot be accepted.` | 请求体不是桌面端形状的新文案（2026-11-13 起；`node` UA + 本机真实机器指纹 + 缺 system 消息。网关与桌面端同机部署时这就是**常态**） | 别只认旧文案 `not one DeepAI Code sends`：`BodyRejected` 要两种都匹配，否则 `ChatBodyFallback` 不重试（见 `docs/recon.md` §5.2） |
 | 上游模型目录默认模型为空 | 字段叫 `default` 不是 `default_model` | 不要加 `default_model` 兼容，会静默拿不到值 |
 | 池内账号 `granted=0` | 共用机器指纹，每日额度只发一次 | 不要去掉 `Account.MachineID` 回退逻辑 |
 | 长响应被掐断 | 上游心跳 `: keep-alive` 被丢弃 | `streamChat` 要原样透传注释行 |

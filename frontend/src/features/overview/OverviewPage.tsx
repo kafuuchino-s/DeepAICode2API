@@ -11,7 +11,12 @@ type Stats = {
   total_cost: number; total_chars_out: number; day?: string; day_tokens_in?: number; day_tokens_out?: number;
   started_at: number; reset_at?: number;
 };
-type Overview = { accounts: number; ready: number; stats: Stats; default_model?: string; models_updated?: number };
+type Latency = { p50_ms?: number; p95_ms?: number; p99_ms?: number };
+type Checkin = { attempts?: number; blocked?: number; timeouts?: number; p50_ms?: number; p95_ms?: number };
+type UpstreamError = { path: string; code: string; status: number; count: number };
+type Overview = { accounts: number; ready: number; stats: Stats; default_model?: string; models_updated?: number;
+  latency?: Latency; latency_by_endpoint?: Record<string, Latency> | null; checkin?: Checkin;
+  fallback_total?: number; upstream_errors?: UpstreamError[] | null };
 type Health = { degraded: number; blocked: number; quota_fresh: number; quota_due: number };
 type Model = { id: string; name?: string; free?: boolean; api?: string; contextWindow?: number };
 type Models = { models: Model[] | null; default_model?: string; models_updated?: number };
@@ -25,6 +30,30 @@ function PanelTitle({ title, detail, action }: { title: string; detail?: ReactNo
 
 function StatCard({ label, value, detail, icon: Icon }: { label: string; value: string; detail: ReactNode; icon: typeof Activity }) {
   return <div className={`${card} min-w-0 p-4 sm:p-5`}><div className="flex items-center justify-between gap-3"><p className="text-sm text-muted-foreground">{label}</p><Icon size={17} className="shrink-0 text-muted-foreground" aria-hidden="true" /></div><p className="mt-3 break-words text-2xl font-normal tracking-tight tabular-nums">{value}</p><p className="mt-1.5 text-xs leading-5 text-muted-foreground">{detail}</p></div>;
+}
+
+function ProcessMetrics({ data, loading, format }: { data?: Overview; loading: boolean; format: (n: number) => string }) {
+  const { t } = useI18n();
+  const ms = (value: number | undefined) => typeof value === 'number' && Number.isFinite(value) && value > 0 ? `${format(value)} ms` : '—';
+  const count = (value: number | undefined) => typeof value === 'number' && Number.isFinite(value) ? format(value) : '—';
+  const available = !!data && (data.latency !== undefined || data.checkin !== undefined || data.fallback_total !== undefined || data.upstream_errors !== undefined || data.latency_by_endpoint !== undefined);
+  const endpoints = Object.entries(data?.latency_by_endpoint || {});
+  const latency = data?.latency;
+  const checkin = data?.checkin;
+  return <section className={`${card} min-w-0 p-4 sm:p-5`} aria-label={t('进程运行指标', 'Process metrics')}>
+    <PanelTitle title={t('进程运行指标', 'Process metrics')} detail={t('当前进程期间的直方图分桶估计，重启后重置；— 表示暂无样本或数据不可用。', 'Histogram bucket estimates for the current process; reset on restart. — means no samples or data unavailable.')} />
+    {loading ? <p className="mt-5 text-sm text-muted-foreground">{t('正在加载运行指标…', 'Loading process metrics…')}</p> : !available ? <p className="mt-5 text-sm text-muted-foreground">{t('当前服务未提供运行指标。', 'Process metrics are unavailable from this server.')}</p> : <>
+      <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+        <div><h3 className="text-sm font-medium">{t('请求耗时', 'Request latency')}</h3><p className="mt-2 text-xs text-muted-foreground">P50 / P95 / P99</p><p className="mt-1 text-sm tabular-nums">{ms(latency?.p50_ms)} / {ms(latency?.p95_ms)} / {ms(latency?.p99_ms)}</p></div>
+        <div><h3 className="text-sm font-medium">{t('签到等待', 'Check-in wait')}</h3><p className="mt-2 text-xs text-muted-foreground">P50 / P95</p><p className="mt-1 text-sm tabular-nums">{ms(checkin?.p50_ms)} / {ms(checkin?.p95_ms)}</p><p className="mt-2 text-xs leading-5 text-muted-foreground">{t('尝试', 'Attempts')} {count(checkin?.attempts)} · {t('阻塞', 'Blocked')} {count(checkin?.blocked)} · {t('超时', 'Timeouts')} {count(checkin?.timeouts)}</p></div>
+        <div><h3 className="text-sm font-medium">{t('请求形状兜底', 'Request shape fallbacks')}</h3><p className="mt-2 text-lg tabular-nums">{count(data?.fallback_total)}</p></div>
+      </div>
+      <div className="mt-5 grid gap-5 border-t border-border pt-5 lg:grid-cols-2">
+        <div className="min-w-0"><h3 className="text-sm font-medium">{t('按端点的耗时', 'Latency by endpoint')}</h3><p className="mt-1 text-xs text-muted-foreground">P50 / P95 / P99</p>{endpoints.length ? <dl className="mt-2 divide-y divide-border">{endpoints.map(([endpoint, item]) => <div key={endpoint} className="flex flex-wrap justify-between gap-2 py-2 text-sm"><dt className="break-all text-muted-foreground">{endpoint}</dt><dd className="tabular-nums">{ms(item.p50_ms)} / {ms(item.p95_ms)} / {ms(item.p99_ms)}</dd></div>)}</dl> : <p className="mt-2 text-sm text-muted-foreground">{data?.latency_by_endpoint == null ? t('数据不可用。', 'Data unavailable.') : t('暂无端点样本。', 'No endpoint samples yet.')}</p>}</div>
+        <div className="min-w-0"><h3 className="text-sm font-medium">{t('上游错误', 'Upstream errors')}</h3>{data?.upstream_errors?.length ? <ul className="mt-2 divide-y divide-border">{data.upstream_errors.map((error, index) => <li key={`${error.path}-${error.code}-${error.status}-${index}`} className="flex flex-wrap justify-between gap-2 py-2 text-sm"><span className="min-w-0 break-all text-muted-foreground">{error.path} · {error.code} · {error.status}</span><span className="tabular-nums">{count(error.count)}</span></li>)}</ul> : <p className="mt-2 text-sm text-muted-foreground">{data?.upstream_errors == null ? t('数据不可用。', 'Data unavailable.') : t('暂无上游错误。', 'No upstream errors yet.')}</p>}<p className="mt-2 text-xs text-muted-foreground">{t('最多显示数量最多的 8 类。', 'Up to the 8 most frequent categories are shown.')}</p></div>
+      </div>
+    </>}
+  </section>;
 }
 
 function ChartTooltip({ active, payload }: TooltipProps<number, string>) {
@@ -110,6 +139,8 @@ export default function OverviewPage() {
         {health.isError ? <p role="alert" className="mt-6 text-sm text-destructive">{t('无法加载账号健康状态。', 'Could not load account health.')} <button className="underline" onClick={() => void health.refetch()}>{t('重试', 'Retry')}</button></p> : <dl className="mt-6 divide-y divide-border text-sm">{[[t('近期失败', 'Recently failed'), health.data?.degraded], [t('受限', 'Blocked'), health.data?.blocked], [t('额度待刷新', 'Quota refresh due'), health.data?.quota_due], [t('额度已更新', 'Quota fresh'), health.data?.quota_fresh]].map(([label, value]) => <div key={String(label)} className="flex items-center justify-between gap-3 py-3"><dt className="text-muted-foreground">{label}</dt><dd className="font-medium tabular-nums">{typeof value === 'number' ? format(value) : '—'}</dd></div>)}</dl>}
       </section>
     </div>
+
+    <ProcessMetrics data={data} loading={overview.isPending} format={format} />
 
     <section className={`${card} p-4 sm:p-5`}>
       <PanelTitle title={t('已观察用量', 'Observed usage')} detail={t(`所选 ${period} 天内，上游实际提供的数据。`, `Values supplied by upstream during the selected ${period} days.`)} />

@@ -13,7 +13,7 @@ import (
 // React 控制台构建产物和兼容旧页面缓存的静态资源都内嵌到二进制。
 // 修改 frontend 后需更新 web/dist；运行和 Go 构建不需要 Node。
 //
-//go:embed web/index.html web/login.html web/style.css web/favicon.ico web/apple-touch-icon.png web/js/*.js web/js/render/*.js web/dist
+//go:embed web/index.html web/login.html web/style.css web/favicon.ico web/apple-touch-icon.png web/js/*.js web/js/render/*.js web/js/i18n/*.js web/dist
 var consoleAssets embed.FS
 
 func mustConsoleAsset(name string) []byte {
@@ -152,6 +152,14 @@ func (s *Server) handleConsoleAsset(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		name = "web/js/render/" + rest
+	case strings.HasPrefix(p, "js/i18n/"):
+		// i18n/ 与 render/ 同规则：只允许一层扁平文件名
+		rest := strings.TrimPrefix(p, "js/i18n/")
+		if rest == "" || strings.ContainsAny(rest, "/\\") || strings.Contains(rest, "..") {
+			http.NotFound(w, r)
+			return
+		}
+		name = "web/js/i18n/" + rest
 	case strings.HasPrefix(p, "js/"):
 		rest := strings.TrimPrefix(p, "js/")
 		// 只允许扁平文件名：不能有子目录、反斜杠或 ..

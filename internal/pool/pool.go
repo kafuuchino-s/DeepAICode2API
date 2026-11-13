@@ -51,6 +51,11 @@ func (s *Scheduler) Pick(accounts []*deepai.Account, group string) *deepai.Accou
 // skip 用于「并发槽位已满」这类与账号健康度无关的临时排除，必须是**纯函数**：
 // 第一轮扫描不到时会再扫第二轮，同一账号可能被问两次。
 func (s *Scheduler) PickFiltered(accounts []*deepai.Account, group string, skip func(*deepai.Account) bool) *deepai.Account {
+	return s.PickFilteredForQuota(accounts, group, skip, false)
+}
+
+// PickFilteredForQuota 允许免费或价格未知的模型尝试额度耗尽的账号。
+func (s *Scheduler) PickFilteredForQuota(accounts []*deepai.Account, group string, skip func(*deepai.Account) bool, allowExhausted bool) *deepai.Account {
 	group = strings.TrimSpace(group)
 	eligible := func(a *deepai.Account) bool {
 		if !a.Enabled {
@@ -59,6 +64,11 @@ func (s *Scheduler) PickFiltered(accounts []*deepai.Account, group string, skip 
 		// 上游策略拦截（social_login_required）是账号级终态：
 		// 继续轮询只会把每个请求都撞一次 403。
 		if a.Status == deepai.StatusBlocked {
+			return false
+		}
+		// 当日额度用完（theos_exhausted）：到点前不参与调度，避免每个请求
+		// 都白撞一次 403。过了 QuotaUntil 自动恢复，无需人工处理。
+		if !allowExhausted && a.QuotaUntil > 0 && time.Now().Unix() < a.QuotaUntil {
 			return false
 		}
 		if group != "" && !strings.EqualFold(a.GroupName(), group) {
@@ -75,9 +85,18 @@ func (s *Scheduler) PickFiltered(accounts []*deepai.Account, group string, skip 
 // HasEligible 报告池里是否存在可调度账号（分组 / 启用 / 未拦截），
 // 忽略 PickFiltered 的 skip。调用方用它区分「全忙」与「池里没号」。
 func (s *Scheduler) HasEligible(accounts []*deepai.Account, group string) bool {
+	return s.HasEligibleForQuota(accounts, group, false)
+}
+
+// HasEligibleForQuota 与 PickFilteredForQuota 使用相同的额度规则。
+func (s *Scheduler) HasEligibleForQuota(accounts []*deepai.Account, group string, allowExhausted bool) bool {
 	group = strings.TrimSpace(group)
+	now := time.Now().Unix()
 	for _, a := range accounts {
 		if a == nil || !a.Enabled || a.Status == deepai.StatusBlocked {
+			continue
+		}
+		if !allowExhausted && a.QuotaUntil > 0 && now < a.QuotaUntil {
 			continue
 		}
 		if group == "" || strings.EqualFold(a.GroupName(), group) {

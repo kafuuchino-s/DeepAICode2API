@@ -96,6 +96,10 @@ type Server struct {
 	versionCache    *versionInfo
 	versionAt       time.Time
 	versionInFlight chan struct{}
+
+	// shapeNeed 记忆「哪些调用方需要桌面端形状」（见 shape.go）。
+	shapeMu   sync.Mutex
+	shapeNeed map[string]time.Time
 }
 
 // New 构造服务。
@@ -113,11 +117,27 @@ func New(st *store.Store) *Server {
 		adminGuard:         newAdminGuard(),
 		metrics:            newMetrics(),
 	}
-	// 上次探测到的车道优先（跨重启保留），否则用编译期默认值。
+	// 上次探测到的车道优先（跨重启保留），但较新的编译期默认值优先于更旧的探测值：
+	// 否则升级到对齐新客户端的版本后，还会用旧车道跑到下一轮探测。
 	if lane := strings.TrimSpace(st.Settings().Lane); lane != "" {
-		s.Up.SetLane(lane)
+		s.Up.SetLane(newerLane(lane))
 	}
+	s.applyRuntimeSettings()
 	return s
+}
+
+// applyRuntimeSettings 把「可运行期调整」的设置同步到已缓存的客户端。
+//
+// 车道走 SetLane；签到预算走 SetCheckInBudget。两者都必须同时覆盖
+// s.Up 和按代理缓存的客户端，否则直连号与代理号表现不一致。
+func (s *Server) applyRuntimeSettings() {
+	budget := time.Duration(s.Store.Settings().CheckinBlockMS) * time.Millisecond
+	s.Up.SetCheckInBudget(budget)
+	s.proxyMu.Lock()
+	for _, c := range s.proxyClients {
+		c.SetCheckInBudget(budget)
+	}
+	s.proxyMu.Unlock()
 }
 
 // Handler 返回完整路由。

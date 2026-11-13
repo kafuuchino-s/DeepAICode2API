@@ -15,7 +15,7 @@ const DefaultSystemPrompt = "You are a helpful AI assistant. Answer the user's r
 // 仅在上游以 “This request is not one DeepAI Code sends.” 拒绝后作为兜底
 // 重试使用；正常路径仍然透传客户端的原始字段。
 //
-// 实测桌面端（0.3.20，2026-11-11 用 0.3.35 复核；pi 运行时同为 1.3.0，请求体形状未变）
+// 实测桌面端（0.3.20，2026-11-13 用 0.3.36 复核；pi 运行时同为 1.3.0，请求体形状未变）
 // 每个 chat 请求发的是：
 //
 //	model / messages / stream / stream_options / store=false /
@@ -98,4 +98,35 @@ func hasSystemMessage(msgs []any) bool {
 		}
 	}
 	return false
+}
+
+// EnsureSystemMessage 只在缺少 system / developer 消息时补一条默认提示词。
+//
+// 与 ChatBodyFallback 的区别：这里**不动**其它字段（不裁剪白名单），
+// 因此可以在正常路径上预置，而不会悄悄改掉调用方显式给出的采样参数。
+// 返回 inserted=true 表示请求体已被改写。
+func EnsureSystemMessage(body []byte, systemPrompt string) ([]byte, bool) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
+	}
+	msgs, ok := payload["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return nil, false
+	}
+	if hasSystemMessage(msgs) {
+		return body, false
+	}
+	if systemPrompt == "" {
+		systemPrompt = DefaultSystemPrompt
+	}
+	withSystem := make([]any, 0, len(msgs)+1)
+	withSystem = append(withSystem, map[string]any{"role": "system", "content": systemPrompt})
+	withSystem = append(withSystem, msgs...)
+	payload["messages"] = withSystem
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }

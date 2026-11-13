@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"deepaicode2api/internal/deepai"
 	"deepaicode2api/internal/store"
@@ -78,6 +79,30 @@ func TestAccountsPageEndpoint(t *testing.T) {
 	}
 	if page.Total != 2 {
 		t.Fatalf("分组过滤 total = %d，期望 2", page.Total)
+	}
+}
+
+// TestAccountsPageReportsQuotaRecovery 让管理台能解释启用但暂不可调度的账号。
+func TestAccountsPageReportsQuotaRecovery(t *testing.T) {
+	s, key := newTestServer(t, nil)
+	until := time.Now().Add(time.Hour).Unix()
+	s.Store.UpdateAccount("acc-1", func(a *deepai.Account) { a.QuotaUntil = until })
+
+	rec := do(t, s, http.MethodGet, "/admin/api/accounts", key, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d：%s", rec.Code, rec.Body.String())
+	}
+	var page struct {
+		Items []struct {
+			ID         string `json:"id"`
+			QuotaUntil int64  `json:"quota_until"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("解析: %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "acc-1" || page.Items[0].QuotaUntil != until {
+		t.Fatalf("账号额度恢复时间不正确: %+v", page.Items)
 	}
 }
 

@@ -84,7 +84,7 @@ describe('console shell', () => {
     vi.stubGlobal('fetch', vi.fn((path: string) => {
       if (path === '/health') {
         healthRequests++;
-        return healthRequests === 2 ? Promise.resolve(json({}, 503)) : Promise.resolve(json({ ready: 2, accounts: 5, degraded: 1, models: 7 }));
+        return healthRequests === 2 || healthRequests === 3 ? Promise.resolve(json({}, 503)) : Promise.resolve(json({ ready: 2, accounts: 5, degraded: 1, models: 7 }));
       }
       return Promise.resolve(json(path === '/admin/api/accounts' ? { value: 1 } : { current: 'dev' }));
     }));

@@ -40,10 +40,19 @@ func (b *releaseBody) Close() error {
 // 实现要点：选号在 store 里一次读完（只拷贝被选中的那个），忙号通过纯谓词
 // 排除；acquireAccount 只处理「检查到占用」的窄竞态，失败就排除后重试。
 func (s *Server) pickFreeAccount(group string) (*deepai.Account, bool, bool) {
+	return s.pickFreeAccountForQuota(group, false, nil)
+}
+
+// pickFreeAccountForQuota 保留已拒绝当前请求的账号集合，避免未知价格的模型反复撞同一个号。
+func (s *Server) pickFreeAccountForQuota(group string, allowExhausted bool, rejected map[string]struct{}) (*deepai.Account, bool, bool) {
+	group = strings.TrimSpace(group)
 	// excluded 用切片而不是 map：重试只在「检查与占用撞车」时发生，通常 0~1 次，
 	// 切片比 map 少一次分配，而选号是每个请求一次的热路径。
 	var excluded []string
 	skip := func(a *deepai.Account) bool {
+		if _, denied := rejected[a.ID]; denied {
+			return true
+		}
 		for _, id := range excluded {
 			if id == a.ID {
 				return true
@@ -52,8 +61,14 @@ func (s *Server) pickFreeAccount(group string) (*deepai.Account, bool, bool) {
 		return s.accountBusy(a.ID)
 	}
 	for {
-		a, candidates := s.Store.PickAccount(group, skip)
+		a, candidates := s.Store.PickAccountForQuota(group, skip, allowExhausted)
 		if a == nil {
+			if candidates && len(rejected) > 0 {
+				candidates = s.Store.AnySchedulableForQuota(func(a *deepai.Account) bool {
+					_, denied := rejected[a.ID]
+					return !denied && (group == "" || strings.EqualFold(a.GroupName(), group))
+				}, allowExhausted)
+			}
 			return nil, false, candidates
 		}
 		if s.acquireAccount(a.ID) {
@@ -99,15 +114,16 @@ func (s *Server) releaseAccount(id string) {
 	}
 }
 
-// hasFreeAccount 报告池里是否还有账号有空在途槽位。
+// hasFreeAccount 报告指定分组中是否有另一个账号有空在途槽位。
 //
-// 409 之后用它区分「立即换号」与「整池都满，等一等」：以前一律先
-// sleep(Retry-After) 再换号，最坏白等 30s，还把非流式预算（90s）吃掉。
+// 409 之后，刚被上游拒绝的账号不算可立即换入；没有其他候选时需要遵守 Retry-After。
 // 只做一次指针扫描 + map 查询，不复制整个号池。
-func (s *Server) hasFreeAccount() bool {
-	return s.Store.AnySchedulable(func(a *deepai.Account) bool {
-		return !s.accountBusy(a.ID)
-	})
+func (s *Server) hasFreeAccount(group, exclude string, rejected map[string]struct{}, allowExhausted bool) bool {
+	group = strings.TrimSpace(group)
+	return s.Store.AnySchedulableForQuota(func(a *deepai.Account) bool {
+		_, denied := rejected[a.ID]
+		return !denied && a.ID != exclude && (group == "" || strings.EqualFold(a.GroupName(), group)) && !s.accountBusy(a.ID)
+	}, allowExhausted)
 }
 
 // errAllAccountsBusy 表示所有候选账号都达到了并发上限。
