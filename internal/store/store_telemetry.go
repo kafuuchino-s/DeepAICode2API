@@ -81,6 +81,10 @@ func (s *Store) Logs(limit int) []LogEntry {
 
 // Record 记录一次请求结果并更新统计。
 func (s *Store) Record(e LogEntry, outChars int) {
+	s.recordAt(e, outChars, time.Now())
+}
+
+func (s *Store) recordAt(e LogEntry, outChars int, now time.Time) {
 	s.mu.Lock()
 	s.st.Stats.TotalRequests++
 	// 499 是「客户端先走了」：既不计成功也不计失败，只留在日志里供排查。
@@ -93,11 +97,12 @@ func (s *Store) Record(e LogEntry, outChars int) {
 	s.st.Stats.TotalTokensOut += int64(e.TokensOut)
 	s.st.Stats.TotalCachedTokens += int64(e.CachedTokens)
 	// 当日用量：跨天时先清零（不用定时任务，读路径上判定即可）。
-	rollStatsDay(&s.st.Stats, time.Now())
+	rollStatsDay(&s.st.Stats, now)
 	s.st.Stats.DayTokensIn += int64(e.TokensIn)
 	s.st.Stats.DayTokensOut += int64(e.TokensOut)
 	s.st.Stats.DayCachedTokens += int64(e.CachedTokens)
 	s.st.Stats.TotalCost += e.Cost
+	s.recordTrendLocked(e, now)
 	s.statsDirty = true
 	keep := s.st.Settings.LogKeep
 	logs := s.logs
@@ -149,8 +154,11 @@ func (s *Store) ClearStats() {
 	}
 	// 保留 StartedAt（进程起点），单独记 ResetAt：日志不清空，
 	// 控制台需要能解释「统计数小于日志条数」。
-	day := time.Now().Format(statsDayLayout)
-	s.st.Stats = Stats{StartedAt: started, ResetAt: time.Now().Unix(), Day: day}
+	now := time.Now()
+	day := now.Format(statsDayLayout)
+	s.st.Stats = Stats{StartedAt: started, ResetAt: now.Unix(), Day: day}
+	s.trend = trendState{StartedAt: now.Unix(), Days: make(map[string]TrendDay)}
+	s.statsRevision++
 	s.statsDirty = true
 	s.mu.Unlock()
 }

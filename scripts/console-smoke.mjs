@@ -1,11 +1,9 @@
-// 控制台的 DOM 冒烟测试（Node，无第三方依赖）。
+// 旧版 ES module 控制台的 DOM 兼容冒烟测试（Node，无第三方依赖）。
+// 旧资源仍供使用缓存页面的客户端访问；新 React 控制台请运行
+// `npm --prefix frontend test`，此脚本不覆盖新界面。
 //
-// 为什么需要它：控制台是纯前端，`go test` 只能断言「字符串存在」，抓不到
-// ReferenceError / TypeError。拆模块时最容易出的就是这类断裂——文件都对、
-// 语法都对、测试全绿，点一下按钮才炸（本轮就抓到过 `lang` 与 `acctPage`）。
-//
-// 做法：用一个极简 DOM 桩把 web/js/*.js 跑起来，import 即执行全部顶层接线，
-// 然后给四个渲染函数喂固定数据。任何未捕获异常都会让进程退出码非 0。
+// 用极简 DOM 桩运行 web/js/*.js 的顶层接线和四个渲染函数；
+// 任何未捕获异常都会让进程退出码非 0。
 //
 // 用法：node scripts/console-smoke.mjs
 import { fileURLToPath, pathToFileURL } from 'node:url';

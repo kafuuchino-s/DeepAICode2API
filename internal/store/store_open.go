@@ -98,6 +98,8 @@ func OpenWithKey(path string, key []byte) (*Store, error) {
 	if s.st.Stats.StartedAt == 0 {
 		s.st.Stats.StartedAt = time.Now().Unix()
 	}
+	// 旧统计没有日汇总，覆盖只从本次启用开始，绝不回填为零。
+	s.initTrend(time.Now())
 	if !hadStatsFile {
 		// 首次运行或从旧格式迁移：必须把统计写到旁路文件，
 		// 否则它只活在内存里，下次重启就丢了。
@@ -161,11 +163,12 @@ func (s *Store) loadStats() error {
 	if uerr != nil {
 		return fmt.Errorf("统计文件解析失败: %w", uerr)
 	}
-	var st Stats
-	if err := json.Unmarshal(plain, &st); err != nil {
+	var data statsFile
+	if err := json.Unmarshal(plain, &data); err != nil {
 		return fmt.Errorf("统计文件解析失败: %w", err)
 	}
-	s.st.Stats = st
+	s.st.Stats = data.Stats
+	s.trend = data.ObservedTrend
 	return nil
 }
 
@@ -190,7 +193,8 @@ func (s *Store) Save() error {
 	key := s.masterKey
 	last := s.lastSaved
 	enc := s.encrypted
-	stats := s.st.Stats
+	stats := s.statsSnapshotLocked()
+	statsRevision := s.statsRevision
 	statsDirty := s.statsDirty
 	logs := s.logs
 	s.mu.RUnlock()
@@ -224,7 +228,7 @@ func (s *Store) Save() error {
 		if err := writeAtomicSealed(s.statsPath, rawStats, key); err != nil {
 			return err
 		}
-		s.clearStatsDirtyIfUnchanged(stats)
+		s.clearStatsDirtyIfSnapshotUnchanged(stats.Stats, statsRevision)
 	}
 
 	// 3) 日志缓冲。
@@ -302,6 +306,15 @@ func quantizeTimestamp(t int64) int64 {
 func (s *Store) clearStatsDirtyIfUnchanged(written Stats) {
 	s.mu.Lock()
 	if s.st.Stats == written {
+		s.statsDirty = false
+	}
+	s.mu.Unlock()
+}
+
+// 日汇总可能在累计数相同的情况下被重置；版本同时保护汇总快照。
+func (s *Store) clearStatsDirtyIfSnapshotUnchanged(written Stats, revision uint64) {
+	s.mu.Lock()
+	if s.st.Stats == written && s.statsRevision == revision {
 		s.statsDirty = false
 	}
 	s.mu.Unlock()

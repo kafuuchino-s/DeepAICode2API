@@ -189,6 +189,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/favicon.ico", s.handleConsoleAsset)
 	mux.HandleFunc("/apple-touch-icon.png", s.handleConsoleAsset)
 	mux.HandleFunc("/js/", s.handleConsoleAsset)
+	mux.HandleFunc("/assets/", s.handleConsoleAsset)
 	mux.HandleFunc("/", s.handleRoot)
 
 	// 压缩在最内层：外层（观测）看到的是压缩后的字节数。

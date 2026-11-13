@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -27,28 +28,33 @@ func TestLoginPageServed(t *testing.T) {
 		t.Fatalf("/login Content-Type = %q", ct)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`id="loginForm"`, `id="loginPw"`, `id="loginErr"`, `/js/login.js`} {
-		if !strings.Contains(body, want) {
-			t.Errorf("/login 缺少 %s", want)
-		}
+	if !strings.Contains(body, `id="root"`) || !strings.Contains(body, `/assets/`) {
+		t.Error("/login 应返回构建后的控制台入口")
 	}
-	// 登录页不该把控制台的表单带出来（两页职责不同，混在一起会让人以为
-	// 没登录也能直接改数据）。
+	// 登录表单、错误反馈及口令存储由前端行为测试覆盖。
 	if strings.Contains(body, `id="acctTable"`) {
-		t.Error("/login 不应包含控制台账号表")
+		t.Error("/login 不应直接包含控制台账号表")
 	}
 }
 
-func TestLoginScriptServed(t *testing.T) {
+func TestAdminAuthPasswordHeader(t *testing.T) {
 	u := newWarmupUpstream(t)
 	s, _ := newTestServer(t, u)
+	s.Store.UpdateSettings(func(st *store.Settings) { st.AdminPassword = "s3cret" })
 
-	rec := do(t, s, http.MethodGet, "/js/login.js", "", "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("/js/login.js HTTP %d", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "/admin/api/auth") {
-		t.Error("login.js 应调用 /admin/api/auth 校验口令")
+	// 新登录表单发送 X-Admin-Password；不能只测试 Bearer 兼容方式。
+	for _, tc := range []struct {
+		password string
+		want     int
+	}{{"wrong", http.StatusUnauthorized}, {"s3cret", http.StatusOK}} {
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/auth", strings.NewReader("{}"))
+		req.RemoteAddr = "127.0.0.1:34567"
+		req.Header.Set("X-Admin-Password", tc.password)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("使用 X-Admin-Password 登录：status=%d，want %d", rec.Code, tc.want)
+		}
 	}
 }
 

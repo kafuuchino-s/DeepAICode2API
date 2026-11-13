@@ -139,7 +139,7 @@ func isStaticAsset(path string) bool {
 	case path == "/style.css", path == "/ping",
 		path == "/favicon.ico", path == "/apple-touch-icon.png":
 		return true
-	case strings.HasPrefix(path, "/js/"):
+	case strings.HasPrefix(path, "/js/"), strings.HasPrefix(path, "/assets/"):
 		return true
 	}
 	return false

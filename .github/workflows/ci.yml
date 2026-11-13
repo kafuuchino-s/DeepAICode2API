@@ -35,16 +35,20 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      # 前端是零构建的 ES module：没有打包器兜语法，用 node 的 module
-      # 解析器逐文件校验，再跑一遍 DOM 桩冒烟（import 即触发顶层接线）。
-      - name: console (js syntax + smoke)
+      # actions/setup-node v4.4.0；与 Docker 前端构建使用相同的 Node 主版本。
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: console (build + behavior tests)
         run: |
-          files=$(ls internal/server/web/js/*.js \
-                       internal/server/web/js/render/*.js)
-          for f in $files; do
-            node --input-type=module --check < "$f"
-          done
-          node scripts/console-smoke.mjs
+          npm --prefix frontend ci
+          npm --prefix frontend test
+          npm --prefix frontend run build
+          git diff --exit-code -- internal/server/web/dist
+          test -z "$(git ls-files --others --exclude-standard -- internal/server/web/dist)"
 
       - name: build
         run: |

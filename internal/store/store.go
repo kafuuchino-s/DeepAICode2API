@@ -66,7 +66,12 @@ type LogEntry struct {
 	// CachedTokens 是上游报告的前缀缓存命中 token 数（无此字段时为 0）。
 	CachedTokens int     `json:"cached_tokens,omitempty"`
 	Cost         float64 `json:"cost"`
-	Err          string  `json:"err,omitempty"`
+	// nil 表示旧记录没有上报状态；false 是本次未上报，true 包括显式的零。
+	TokensInReported  *bool  `json:"tokens_in_reported,omitempty"`
+	TokensOutReported *bool  `json:"tokens_out_reported,omitempty"`
+	CachedReported    *bool  `json:"cached_tokens_known,omitempty"`
+	CostReported      *bool  `json:"cost_known,omitempty"`
+	Err               string `json:"err,omitempty"`
 }
 
 // Stats 是累计统计。
@@ -149,6 +154,9 @@ type Store struct {
 	lastSaved []byte
 	// statsDirty 标记统计数据有变化（单独小文件，每次请求都会变）。
 	statsDirty bool
+	// 日汇总与累计统计在同一个旁路文件中原子保存。
+	trend         trendState
+	statsRevision uint64
 
 	// savesTotal / savedBytes 是主文件的实际写盘次数与明文字节数。
 	//

@@ -99,7 +99,7 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 			return
 		}
 		rewriteResponsesModel(out, rl.model)
-		usage := parseUsage(out["usage"])
+		usage := rl.observeUsage(out["usage"])
 		outLen := responsesTextLen(out)
 		encoded, _ := json.Marshal(out)
 		rl.done(outLen, usage, nil)
@@ -132,7 +132,7 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 		}
 		rewriteResponsesModel(obj, rl.model)
 		if respObj, ok := obj["response"].(map[string]any); ok {
-			if u := parseUsage(respObj["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
+			if u := rl.observeUsage(respObj["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
 				usage = u
 			}
 		}
@@ -170,7 +170,7 @@ func (s *Server) blockingResponsesAsChat(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	respObj := chatToResponsesObject(out, rl.model)
-	usage := parseUsage(out["usage"])
+	usage := rl.observeUsage(out["usage"])
 	outLen := responsesTextLen(respObj)
 
 	rl.done(outLen, usage, nil)
@@ -206,7 +206,7 @@ func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, c
 		outLen int
 	)
 	streamErr := forEachChatChunk(resp.Body, func(chunk map[string]any) bool {
-		if u := parseUsage(chunk["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
+		if u := rl.observeUsage(chunk["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
 			usage = u
 		}
 		d, finish := chatChunkDelta(chunk)

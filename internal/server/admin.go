@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"deepaicode2api/internal/registry"
@@ -156,7 +157,23 @@ func (s *Server) handleAdminLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
 		s.Store.ClearStats()
+		if !s.persistOrFail(w) {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Query().Get("trend") == "days" {
+		days := 30
+		if raw := r.URL.Query().Get("days"); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil || value < 1 || value > 365 {
+				writeErr(w, http.StatusBadRequest, "days 必须是 1–365 的整数", "invalid_request_error")
+				return
+			}
+			days = value
+		}
+		writeJSON(w, http.StatusOK, s.Store.TrendDays(days))
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Store.Stats())

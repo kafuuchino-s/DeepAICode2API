@@ -66,7 +66,7 @@ func (s *Server) blockingAnthropic(w http.ResponseWriter, r *http.Request, paylo
 		writeAnthropicUpstreamErr(w, err)
 		return
 	}
-	usage := parseUsage(out["usage"])
+	usage := rl.observeUsage(out["usage"])
 	msg := chatToAnthropicMessage(out, rl.model)
 	outLen := anthropicTextLen(msg)
 
@@ -121,7 +121,7 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 	)
 
 	streamErr = forEachChatChunk(resp.Body, func(chunk map[string]any) bool {
-		if u := parseUsage(chunk["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
+		if u := rl.observeUsage(chunk["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
 			usage = u
 		}
 		d, finish := chatChunkDelta(chunk)

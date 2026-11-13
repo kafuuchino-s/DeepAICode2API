@@ -1,6 +1,8 @@
 .git
 .gitignore
 .github
+frontend/node_modules
+internal/server/web/dist
 deepaicode2api
 deepaicode2api.exe
 register.exe

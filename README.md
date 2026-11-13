@@ -31,7 +31,7 @@
 | 账号接入 | 浏览器登录（Google / Apple / 邮箱密码）、桌面端凭据导入、手工 API Key；入池自动分配机器指纹与代理 |
 | 控制台 | 单页内嵌 UI：账号 / 密钥 / 日志 / 统计 / 设置 |
 | 安全 | 密钥鉴权、管理口令、同源写保护、状态文件 AES-256-GCM 可选加密 |
-| 可回归 | `go test -race`、gofmt、vet、build / vulncheck，CI 覆盖 Go 包与前端语法和冒烟测试 |
+| 可回归 | `go test -race`、gofmt、vet、build / vulncheck，CI 覆盖 Go 包、前端行为测试及构建产物一致性 |
 
 ```text
 ┌──────────────┐  /v1/chat/completions   ┌────────────────┐   Api-Key + Theos 头   ┌─────────────────────────────┐
@@ -223,6 +223,7 @@ export ANTHROPIC_MODEL=glm-5.3-flash
 | `/health` | 账号 / 模型 / 机器指纹摘要；`ready` / `degraded` / `blocked` 三个计数（口径见 §6.4 末段） |
 | `/metrics` | Prometheus 文本格式指标（与 `/admin/api/*` 同级鉴权）：请求量/状态码分类、耗时 sum+count、在途请求、号池分布、goroutine/堆 |
 | `/admin/api/version` | 当前版本 + 最新 release 比对（服务端代查 GitHub，缓存 6h；离线时只回当前版本，不影响控制台） |
+| `/admin/api/stats?trend=days&days=30` | 按 UTC 日期返回请求、用量和上报覆盖情况；`days` 默认为 30，范围为 1–365 |
 | `/admin/api/*` | 账号、密钥、日志、统计、设置、配额、登录 |
 
 > 每个响应都会回写 `X-Request-Id`（合法的传入值原样回显），访问日志是一行一条
@@ -487,12 +488,12 @@ curl -s -X POST localhost:10087/admin/api/checkin   -H "X-Admin-Password: $DEEPA
 
 ## 七、控制台
 
-- **概览**：请求量、失败数、总 token 入/出、**今日 token 入/出**、**缓存命中率**、
-  上游成本、号池就绪数、模型目录（免费 / 付费、Theos、上下文、端点）。
-  Token 与字符按 **K / M / B** 压缩显示（3 位有效数字，悬停看精确值）；模型目录保留精确整数。
-  「今日」按**本地日期**统计，跨天自动清零；缓存命中率 = 上游报告的
-  `cached_tokens / prompt_tokens`（三种上游形态都已归一，见 `gateway.ParseUsage`），
-  没有样本时显示 `—` 而不是 0.0%。
+- **概览**：展示已记录的 API 请求、失败、token 和就绪账号，以及按 UTC 日期汇总的请求趋势、实际收到的用量和模型目录。既有「今日 token」仍按**服务器本地日期**统计。
+  新的每日趋势从启用该版本时开始记录，不从旧日志推算历史；首日和当前日期会标为部分覆盖。
+  请求统计包含写入请求日志的聊天、音频和扩展接口，499 客户端中断计入请求数但不计入失败数。
+  缓存命中率只计算同时上报输入与缓存 token 的请求；费用与用量只汇总上游明确上报的部分，未上报不会当成零。
+  每日汇总与累计统计保存在同一个统计文件中，约每 30 秒及正常退出时保存；异常退出可能丢失最近未保存的数据。启用主密钥时统计文件同样加密。
+  回退到旧版本前请备份统计文件：旧版本再次保存时可能丢弃新版本的每日汇总。
 - **账号**：导入桌面端凭据、浏览器登录、手工添加 API Key、刷新配额；
   列表支持**分组 / 状态 / 关键字**筛选（服务端分页 + 排序）；
   行内菜单除启停 / 删除 / 清错外，还接了存量治理：**补绑代理 / 清除代理、
@@ -502,14 +503,17 @@ curl -s -X POST localhost:10087/admin/api/checkin   -H "X-Admin-Password: $DEEPA
 - **密钥**：签发 `sk-…` 网关密钥；只在创建时显示一次；可**改绑分组**。
   **未签发任何密钥时，仅本机回环允许无密钥调用；非回环来源一律 `503 setup_required`。**
   若监听非回环地址且尚无密钥，启动时会自动生成一个 `bootstrap` 密钥并打印一次。
-- **日志**：端点、模型、流式、状态、耗时、字符数、token、成本、账号；
-  支持按**端点 / 账号 / 最小状态码 / 关键字 / 起始时间**过滤（字符与 token 同样是 K/M）。
+- **模型**：查看可用目录、价格、上下文和输入能力，刷新目录并管理模型别名。
+- **日志**：查看请求详情，按**端点 / 账号 / 最小状态码 / 关键字 / 起始时间**过滤。
+  默认最多返回 200 条；查询仅扫描当前日志文件尾部最多 4 MiB，不包含轮转文件。
+  新记录会区分上游明确返回的零和未上报；旧记录没有上报标记，零值显示为未知。
 - **设置**：超时、重试、日志保留、CORS、兜底模型、严格模型模式、模型别名、管理密码，
   以及按密钥限流（RPS / burst / 并发上限，0 = 不限）。
-- **顶栏版本号**：显示构建版本（`v0.1.2`），点击跳转 releases 页；控制台启动时会
-  向 `/admin/api/version` 查一次最新 release（服务端缓存 6 小时），有新版则高亮提示。
+  如果启动时通过环境变量或参数设置管理密码，重启后会重新使用该值。
+- **侧栏版本号**：显示构建版本（`v0.1.2`），点击跳转上游 releases 页；控制台启动时会
+  向 `/admin/api/version` 查一次最新 release（服务端缓存 6 小时），有新版则显示提示。
 - **登录**：管理口令走独立的 `/login` 页（入口 `POST /admin/api/auth` 校验），
-  成功后才进控制台；口令只保存在**本标签页**的 `sessionStorage`，顶栏只有「退出」。
+  成功后才进控制台；口令只保存在**本标签页**的 `sessionStorage`，侧栏提供「退出」。
   任一管理接口返回 401 时自动清口令并回登录页。未设管理口令时不挡人（本机直通）。
   是否启用登录门由 `/health` 的 `admin_required` 决定。
 
@@ -575,22 +579,11 @@ internal/server/            HTTP 路由、流式收发、控制台（装配层�
   ├─ admin_accounts.go      账号管理入口：GET 分页 / POST 按 action 分发
   ├─ admin_actions.go       10 个 action，各自一个最小请求结构体
   ├─ gateway_alias.go       给 gateway 的包内短名（类型别名，迁移期兼容）
-  └─ web/                   控制台静态包（全部 go:embed 进二进制）
-       ├─ index.html        页面标记（301 行）
-       ├─ style.css         样式（设计令牌 + 布局）
-       ├─ js/app.js         装配层：取数 / URL 状态 / 启动顺序（231 行）
-       ├─ js/events.js      事件接线：导航 / 顶栏 / 筛选 / 排序 / 语言 / 脱敏
-       ├─ js/theme.js       主题、侧边栏收起、移动端抽屉
-       ├─ js/pager.js       账号分页控件（页码 / 每页条数）
-       ├─ js/i18n.js        字典 + 文本替换（零依赖）
-       ├─ js/format.js      纯格式化（零依赖）
-       ├─ js/state.js       共享可变 UI 状态（分页游标）
-       ├─ js/dom.js         DOM 助手 + 行内菜单
-       ├─ js/table.js       表头排序状态与纯函数
-       ├─ js/api.js         管理接口调用（鉴权 / 错误归一 / 去重）
-       ├─ js/ui.js          toast
-       ├─ js/actions.js     账号 / 密钥变更 + 配额探测（刷新通过 setReload 注入）
-       └─ js/render/        四个渲染模块：accounts / keys / logs / settings
+  └─ web/dist/              已构建的控制台资源（go:embed 进二进制）
+frontend/                   React + TypeScript 控制台源码
+  ├─ src/features/          概览、账号、密钥、模型、日志和设置
+  ├─ src/lib/               管理接口、语言等公共功能
+  └─ src/App.tsx            认证、导航、主题和响应式外壳
 ```
 
 分层原则：
@@ -601,6 +594,12 @@ internal/server/            HTTP 路由、流式收发、控制台（装配层�
 
 这样上游协议变动只影响 `deepai`，调度策略变动只影响 `store`，
 测试可以分别对着假上游和临时状态文件跑。
+
+修改控制台后，在仓库根目录执行 `make frontend-install`、`make frontend-test`、
+`make frontend-build`，并将生成的 `internal/server/web/dist/` 随源码一起保存。
+仅构建 Go 服务时无需 Node：`go build ./...` 会直接嵌入仓库中的产物。
+Docker 镜像会在独立 Node 阶段重新构建前端，最终仍只运行一个 Go 服务。
+`scripts/console-smoke.mjs` 只检查旧版 ES module 的缓存兼容性；新界面请使用上述前端测试。
 
 ---
 
@@ -648,7 +647,7 @@ go build -ldflags "-X main.version=v0.1.2" -o bin/deepaicode2api .
 ./bin/deepaicode2api -version    # 打印版本后退出
 ```
 
-- **控制台**顶部显示该版本号；点它打开 releases 页。
+- **控制台**侧栏显示该版本号；点它打开上游 releases 页。
 - **更新检查**：控制台启动时请求 `/admin/api/version`，服务端代查
   `api.github.com/repos/2951461586/DeepAICode2API/releases/latest` 并缓存 6 小时。
   离线、被墙或仓库不可达时只返回当前版本（`error` 字段说明原因），

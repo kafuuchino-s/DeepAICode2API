@@ -1,149 +1,194 @@
-// 用 CDP 驱动无头 Chrome，验证控制台的真实交互（不是只看截图）：
-//   - 页面有没有 JS 异常 / console.error
-//   - 账号表渲染出行
-//   - 点「⋯」能弹出操作菜单
-//   - 点表头会带上 sort/order 参数重新请求
-//   - ?lang=en 会切换文案
+// 用 CDP 驱动已有 Chrome 检查真实控制台：账号行、操作面板、服务端排序、
+// 中英文切换和手机导航。服务需已运行并有账号；需要口令时先在该标签页登录。
 // 用法：node scripts/console-e2e.mjs <baseURL> <shotDir>
-const BASE = process.argv[2] || "http://127.0.0.1:10087";
-const SHOT = process.argv[3] || "bin/shots";
-const DEBUG = "http://127.0.0.1:9222";
+// Chrome 默认使用 127.0.0.1:9222；可通过 CONSOLE_CDP_URL 指定其他本地端口。
+import { mkdirSync, writeFileSync } from 'node:fs';
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const BASE = process.argv[2] || 'http://127.0.0.1:10087';
+const SHOT = process.argv[3] || 'bin/shots';
+const DEBUG = process.env.CONSOLE_CDP_URL || 'http://127.0.0.1:9222';
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function targets() {
-  // 本地 Chrome DevTools 协议只有明文 HTTP（127.0.0.1:9222，无凭据、不跨网），
-  // Semgrep 的 react-insecure-request 在这里是误报。
+  // 本地 Chrome DevTools 协议只监听 127.0.0.1，不携带凭据。
   // pi-lens-ignore: typescript.react.security.react-insecure-request.react-insecure-request
-  const r = await fetch(DEBUG + "/json/list");
-  return r.json();
+  const response = await fetch(DEBUG + '/json/list');
+  if (!response.ok) throw new Error(`无法读取 Chrome targets：HTTP ${response.status}`);
+  return response.json();
 }
 
-function connect(wsUrl) {
+function connect(url) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(url);
     ws.onopen = () => resolve(ws);
-    ws.onerror = (e) => reject(e);
+    ws.onerror = () => reject(new Error('无法连接 Chrome DevTools'));
   });
 }
 
 let seq = 0;
-function send(ws, method, params) {
+function send(ws, method, params = {}) {
   const id = ++seq;
-  return new Promise((resolve) => {
-    const onMsg = (ev) => {
-      let m;
-      try { m = JSON.parse(ev.data); } catch { return; }  // 非法帧直接忽略
-      if (m.id === id) { ws.removeEventListener("message", onMsg); resolve(m.result); }
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      ws.removeEventListener('message', onMessage);
+      reject(new Error(`Chrome DevTools 请求超时：${method}`));
+    }, 15000);
+    const onMessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.id !== id) return;
+      clearTimeout(timeout);
+      ws.removeEventListener('message', onMessage);
+      if (message.error) reject(new Error(`${method}: ${message.error.message}`));
+      else resolve(message.result);
     };
-    ws.addEventListener("message", onMsg);
-    ws.send(JSON.stringify({ id, method, params: params || {} }));
+    ws.addEventListener('message', onMessage);
+    ws.send(JSON.stringify({ id, method, params }));
   });
 }
 
-async function evaluate(ws, expr) {
-  const r = await send(ws, "Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true });
-  if (r && r.exceptionDetails) throw new Error(r.exceptionDetails.text || "eval error");
-  return r && r.result ? r.result.value : undefined;
+async function evaluate(ws, expression) {
+  const result = await send(ws, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+  if (result?.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || 'eval error');
+  return result?.result?.value;
 }
 
-async function shot(ws, name) {
-  const r = await send(ws, "Page.captureScreenshot", { format: "png" });
-  const fs = await import("node:fs");
-  fs.writeFileSync(`${SHOT}/${name}.png`, Buffer.from(r.data, "base64"));
-  console.log("  shot:", name);
+async function waitFor(ws, expression, description) {
+  const end = Date.now() + 12000;
+  while (Date.now() < end) {
+    try {
+      const value = await evaluate(ws, expression);
+      if (value) return value;
+    } catch { /* 页面导航期间执行上下文会短暂不可用。 */ }
+    await sleep(150);
+  }
+  const url = await evaluate(ws, 'location.href').catch(() => 'unknown');
+  throw new Error(`等待${description}超时（当前地址 ${url}）；请检查服务、登录状态及账号数据`);
 }
 
-async function navigate(ws, url) {
-  await send(ws, "Page.enable");
-  const bust = (url.includes("?") ? "&" : "?") + "cb=" + Date.now();
-  await send(ws, "Page.navigate", { url: url.replace("#", bust + "#") });
-  await sleep(2500);
+async function screenshot(ws, name) {
+  const result = await send(ws, 'Page.captureScreenshot', { format: 'png' });
+  mkdirSync(SHOT, { recursive: true });
+  writeFileSync(`${SHOT}/${name}.png`, Buffer.from(result.data, 'base64'));
+  console.log('  shot:', name);
+}
+
+async function navigate(ws, hash, lang = 'zh') {
+  const url = new URL(BASE);
+  url.pathname = '/';
+  url.search = '';
+  url.searchParams.set('lang', lang);
+  url.searchParams.set('cb', String(Date.now()));
+  url.hash = hash;
+  await send(ws, 'Page.navigate', { url: url.href });
+  await waitFor(ws, `location.hash.startsWith(${JSON.stringify('#' + hash)}) && !!document.querySelector('main')`, '控制台页面');
 }
 
 const problems = [];
 const requests = [];
+let ws;
 
-(async () => {
+try {
   const list = await targets();
-  const page = list.find((t) => t.type === "page");
-  if (!page) throw new Error("没有可用的 page target");
-  const ws = await connect(page.webSocketDebuggerUrl);
-
-  ws.addEventListener("message", (ev) => {
-    let m;
-    try { m = JSON.parse(ev.data); } catch { return; }  // 非法帧直接忽略
-    if (m.method === "Runtime.exceptionThrown") {
-      const d = m.params.exceptionDetails;
-      problems.push("exception: " + (d.exception?.description || d.text) +
-        " @" + (d.url || "inline") + ":" + d.lineNumber + ":" + d.columnNumber);
+  const origin = new URL(BASE).origin;
+  const page = list.find((target) => {
+    if (target.type !== 'page') return false;
+    try { return new URL(target.url).origin === origin; } catch { return false; }
+  });
+  if (!page) throw new Error(`没有指向 ${origin} 的 Chrome page target；请先在该标签页打开控制台并登录`);
+  ws = await connect(page.webSocketDebuggerUrl);
+  ws.addEventListener('message', (event) => {
+    let message;
+    try { message = JSON.parse(event.data); } catch { return; }
+    if (message.method === 'Runtime.exceptionThrown') {
+      const detail = message.params.exceptionDetails;
+      problems.push('exception: ' + (detail.exception?.description || detail.text) + ' @' + (detail.url || 'inline') + ':' + detail.lineNumber);
     }
-    if (m.method === "Runtime.consoleAPICalled" && m.params.type === "error") {
-      problems.push("console.error: " + m.params.args.map((a) => a.value ?? a.description).join(" "));
+    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') {
+      problems.push('console.error: ' + message.params.args.map((arg) => arg.value ?? arg.description).join(' '));
     }
-    if (m.method === "Network.requestWillBeSent" && m.params.request.url.includes("/admin/api/accounts")) {
-      requests.push(m.params.request.url);
+    if (message.method === 'Network.requestWillBeSent' && message.params.request.url.includes('/admin/api/accounts')) {
+      requests.push(message.params.request.url);
     }
   });
 
-  await send(ws, "Runtime.enable");
-  await send(ws, "Network.enable");
-  await send(ws, "Network.setCacheDisabled", { cacheDisabled: true });
-  await send(ws, "Log.enable");
-  await send(ws, "Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  await send(ws, 'Page.enable');
+  await send(ws, 'Runtime.enable');
+  await send(ws, 'Network.enable');
+  await send(ws, 'Network.setCacheDisabled', { cacheDisabled: true });
+  await send(ws, 'Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
 
-  // ---- 中文页 ----
-  await navigate(ws, BASE + "/#accounts");
-  const rows = await evaluate(ws, `document.querySelectorAll("#accounts tr").length`);
-  const navLabel = await evaluate(ws, `document.querySelector('nav.nav button[data-tab=overview]').textContent.trim()`);
-  console.log("  rows:", rows, "| nav:", navLabel);
+  await navigate(ws, 'accounts');
+  await waitFor(ws, `document.querySelectorAll('main tbody tr').length > 0`, '账号表格（至少需要一个账号）');
+  const rows = await evaluate(ws, `document.querySelectorAll('main tbody tr').length`);
+  const nav = await evaluate(ws, `document.querySelector('nav a[href="#overview"]')?.textContent.trim()`);
+  console.log('  rows:', rows, '| nav:', nav);
+  if (nav !== '概览') problems.push('中文导航未生效: ' + nav);
 
-  // 打开第一行菜单
-  const hasToggle = await evaluate(ws, `!!document.querySelector("#accounts .menu-toggle")`);
-  if (!hasToggle) problems.push("账号行没有渲染出 ⋯ 菜单按钮");
-  else await evaluate(ws, `document.querySelector("#accounts .menu-toggle").click()`);
-  await sleep(300);
-  const menuItems = await evaluate(ws, `Array.from(document.querySelectorAll(".menu .menu-item")).map(function(b){return b.textContent})`);
-  console.log("  menu:", JSON.stringify(menuItems));
-  if (!menuItems || menuItems.length === 0) problems.push("行内菜单没有渲染出条目");
-  await shot(ws, "cdp-menu-zh");
-
-  // 关闭菜单后点表头排序
-  await evaluate(ws, `document.body.click()`);
+  await evaluate(ws, `document.querySelector('main tbody tr button[aria-label^="账号操作"]').click()`);
+  await waitFor(ws, `document.querySelector('dialog[open]')?.textContent.includes('刷新此账号配额')`, '账号操作面板');
+  await screenshot(ws, 'cdp-menu-zh');
+  await evaluate(ws, `document.querySelector('dialog[open] button[aria-label="关闭"]').click()`);
   requests.length = 0;
-  const hasTh = await evaluate(ws, `!!document.querySelector('#acctTable th[data-sort=theos]')`);
-  if (!hasTh) problems.push("找不到 theos 排序表头");
-  else await evaluate(ws, `document.querySelector('#acctTable th[data-sort=theos]').click()`);
-  await sleep(1200);
-  const sorted = requests.filter((u) => u.includes("sort=theos"));
-  console.log("  sort request:", sorted.length ? sorted.at(-1).split("?")[1] : "(none)");
-  if (!sorted.length) problems.push("点击表头没有发出带 sort=theos 的请求");
-  const arrow = await evaluate(ws, `document.querySelector('#acctTable th[data-sort=theos]').className`);
-  if (!String(arrow).includes("asc")) problems.push("表头排序指示未更新: " + arrow);
+  await evaluate(ws, `Array.from(document.querySelectorAll('main thead th')).find(th => th.textContent.trim() === 'Theos').querySelector('button').click()`);
+  await waitFor(ws, `document.querySelector('main thead th[aria-sort="ascending"]')?.textContent.trim() === 'Theos'`, 'Theos 排序指示');
+  for (let i = 0; i < 40 && !requests.some((url) => new URL(url).searchParams.get('sort') === 'theos'); i++) await sleep(100);
+  const sorted = requests.find((url) => new URL(url).searchParams.get('sort') === 'theos');
+  if (!sorted) problems.push('点击 Theos 表头没有发出服务端排序请求');
+  else console.log('  sort:', new URL(sorted).searchParams.get('sort'), new URL(sorted).searchParams.get('order'));
 
-  // ---- 英文页 ----
-  await navigate(ws, BASE + "/?lang=en#accounts");
-  const enNav = await evaluate(ws, `document.querySelector('nav.nav button[data-tab=overview]').textContent.trim()`);
-  const enTh = await evaluate(ws, `document.querySelector('#acctTable th[data-sort=account]').textContent.trim()`);
-  const enKpi = await evaluate(ws, `document.querySelector("#kpis .k").textContent.trim()`);
-  console.log("  en nav:", enNav, "| en th:", enTh, "| en kpi:", enKpi);
-  if (enNav !== "Overview") problems.push("英文导航未生效: " + enNav);
-  if (enTh !== "Account") problems.push("英文表头未生效: " + enTh);
-  // KPI 标签是 JS 渲染出来的，最容易漏翻（静态检查看不出来）。
-  if (enKpi !== "Total requests") problems.push("英文 KPI 标签未翻译: " + enKpi);
-  await shot(ws, "cdp-accounts-en");
+  await navigate(ws, 'accounts', 'en');
+  await waitFor(ws, `document.querySelectorAll('main tbody tr').length > 0`, '英文账号表格');
+  const enNav = await evaluate(ws, `document.querySelector('nav a[href="#overview"]')?.textContent.trim()`);
+  const enHeader = await evaluate(ws, `document.querySelector('main thead th')?.textContent.trim()`);
+  console.log('  en nav:', enNav, '| en header:', enHeader);
+  if (enNav !== 'Overview') problems.push('英文导航未生效: ' + enNav);
+  if (enHeader !== 'Account') problems.push('英文账号表头未生效: ' + enHeader);
+  await screenshot(ws, 'cdp-accounts-en');
 
-  // 英文概览
-  await navigate(ws, BASE + "/?lang=en#overview");
-  await shot(ws, "cdp-overview-en");
+  await navigate(ws, 'overview', 'en');
+  await waitFor(ws, `Array.from(document.querySelectorAll('main *')).some(el => el.childElementCount === 0 && el.textContent.trim() === 'Total requests')`, '英文概览指标');
+  await screenshot(ws, 'cdp-overview-en');
 
-  ws.close();
+  // Capture the same major pages that are compared with the reference design.
+  // The checks use headings, so data may be empty without changing this entry point.
+  const visualPages = [
+    ['keys', 'API keys'], ['models', 'Models'], ['logs', 'Request logs'], ['settings', 'Settings'],
+  ];
+  async function capturePage(page, heading, name) {
+    await navigate(ws, page, 'en');
+    await waitFor(ws, `document.querySelector('main h1')?.textContent.trim() === ${JSON.stringify(heading)}`, `${heading} 页面`);
+    await waitFor(ws, `!Array.from(document.querySelectorAll('main *')).some(el => el.childElementCount === 0 && /^Loading(…|\\.\\.\\.)$/.test(el.textContent.trim()))`, `${heading} 数据`);
+    await screenshot(ws, name);
+  }
+  for (const [page, heading] of visualPages) await capturePage(page, heading, `cdp-${page}-en`);
+
+  await send(ws, 'Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
+  await navigate(ws, 'accounts', 'en');
+  await waitFor(ws, `!!document.querySelector('button[aria-label="Open navigation"]') && !!document.querySelector('main article')`, '手机账号页面');
+  const widths = await evaluate(ws, `({client: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth})`);
+  if (widths.scroll > widths.client) problems.push(`手机页面横向溢出：${widths.client}/${widths.scroll}`);
+  await evaluate(ws, `document.querySelector('button[aria-label="Open navigation"]').click()`);
+  await waitFor(ws, `!!document.querySelector('[role="dialog"] nav a[href="#accounts"]')`, '手机导航抽屉');
+  await screenshot(ws, 'cdp-mobile-navigation');
+  await send(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await send(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await waitFor(ws, `!document.querySelector('[role="dialog"] nav')`, 'Esc 关闭导航抽屉');
+  await screenshot(ws, 'cdp-mobile-accounts');
+  for (const [page, heading] of [['overview', 'Overview'], ...visualPages]) {
+    await capturePage(page, heading, `cdp-mobile-${page}`);
+    const size = await evaluate(ws, `({client: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth})`);
+    if (size.scroll > size.client) problems.push(`手机 ${heading} 页面横向溢出：${size.client}/${size.scroll}`);
+  }
 
   if (problems.length) {
-    console.log("\n❌ 问题:");
-    problems.forEach((p) => console.log("  -", p));
+    console.error('\n问题:');
+    problems.forEach((problem) => console.error('  -', problem));
     process.exitCode = 1;
-  } else {
-    console.log("\n✅ 交互检查全部通过");
-  }
-})().catch((e) => { console.error("FAILED:", e.message); process.exitCode = 1; });
+  } else console.log('\n交互检查全部通过');
+} catch (error) {
+  console.error('FAILED:', error.message);
+  process.exitCode = 1;
+} finally {
+  ws?.close();
+}

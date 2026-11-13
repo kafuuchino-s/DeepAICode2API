@@ -67,11 +67,11 @@ func TestConsoleFaviconServed(t *testing.T) {
 // 只把文件嵌进二进制不够：页面不写 <link rel="icon">，浏览器仍会去猜默认路径，
 // 移动端「添加到主屏」也拿不到图标。
 func TestConsolePagesReferenceFavicon(t *testing.T) {
-	for _, name := range []string{"web/index.html", "web/login.html"} {
+	for _, name := range []string{"web/dist/index.html"} {
 		page := string(mustConsoleAsset(name))
 		for _, want := range []string{
-			`<link rel="icon" href="/favicon.ico" sizes="any">`,
-			`<link rel="apple-touch-icon" href="/apple-touch-icon.png">`,
+			`rel="icon" href="/favicon.ico"`,
+			`rel="apple-touch-icon" href="/apple-touch-icon.png"`,
 		} {
 			if !strings.Contains(page, want) {
 				t.Errorf("%s 缺少图标声明：%s", name, want)
@@ -103,7 +103,7 @@ func TestConsoleFaviconMatchesDocsAsset(t *testing.T) {
 // 它们和 /style.css、/js/* 一样是纯静态资源：进日志只会把 access 行刷成
 // 「一半是图标」的噪声，还会让 /metrics 的 2xx 计数虚高。
 func TestStaticAssetsSkipAccessLog(t *testing.T) {
-	for _, p := range []string{"/favicon.ico", "/apple-touch-icon.png", "/style.css", "/js/app.js", "/ping"} {
+	for _, p := range []string{"/favicon.ico", "/apple-touch-icon.png", "/style.css", "/js/app.js", "/assets/index-hash.js", "/ping"} {
 		if !isStaticAsset(p) {
 			t.Errorf("%s 应视为静态资源（不写访问日志）", p)
 		}

@@ -1,9 +1,17 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.26-alpine AS build
+FROM node:22-alpine AS frontend
+WORKDIR /src/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+FROM golang:1.26.11-alpine AS build
 
 WORKDIR /src
 COPY go.mod ./
 COPY . .
+COPY --from=frontend /src/internal/server/web/dist ./internal/server/web/dist
 
 # VERSION 可在构建时覆盖，供控制台与 GitHub release 比较。
 # APP_VERSION 兼容旧部署脚本；同时传入时以 VERSION 为准。

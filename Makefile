@@ -10,7 +10,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 GOFILES := find . -name '*.go' -not -path './.git/*'
 
-.PHONY: all build probe test test-race race-shim vet fmt lint cover bench docker clean
+.PHONY: all build frontend-install frontend-build frontend-test probe test test-race race-shim vet fmt lint cover bench docker clean
 
 all: build
 
@@ -18,6 +18,18 @@ all: build
 build:
 	@mkdir -p $(BIN)
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/deepaicode2api .
+
+## frontend-install: 安装前端依赖（仅修改前端时需要）
+frontend-install:
+	npm --prefix frontend ci
+
+## frontend-build: 更新随仓库存储并嵌入 Go 的控制台资源
+frontend-build:
+	npm --prefix frontend run build
+
+## frontend-test: 控制台行为测试
+frontend-test:
+	npm --prefix frontend test
 
 ## probe: 构建上游探测 CLI
 probe:

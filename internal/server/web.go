@@ -6,64 +6,15 @@ import (
 	"encoding/hex"
 	"net/http"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 )
 
-// 控制台是一个「标记 + 样式 + 一组 ES module」的静态包，全部嵌进二进制：
-// 无外部依赖、无构建步骤、离线可用。
+// React 控制台构建产物和兼容旧页面缓存的静态资源都内嵌到二进制。
+// 修改 frontend 后需更新 web/dist；运行和 Go 构建不需要 Node。
 //
-//go:embed web/index.html web/login.html web/style.css web/favicon.ico web/apple-touch-icon.png web/js/*.js web/js/render/*.js
+//go:embed web/index.html web/login.html web/style.css web/favicon.ico web/apple-touch-icon.png web/js/*.js web/js/render/*.js web/dist
 var consoleAssets embed.FS
-
-// consoleHTML 是控制台的页面标记（不含内联脚本与样式）。
-//
-// 保留成变量是为了让契约测试能直接断言标记内容（见 console_test.go）。
-var consoleHTML = mustConsoleAsset("web/index.html")
-
-// consoleCSS 是控制台样式表（已从 index.html 抽出为独立资源）。
-var consoleCSS = mustConsoleAsset("web/style.css")
-
-// consoleJS 返回全部模块化脚本的拼接结果，供契约测试做「字符串存在性」断言。
-//
-// 前端已拆成多个 ES module：断言某个函数名/选择器存在时，必须扫全部脚本，
-// 否则测试会在拆分后静默失效（这比测错更危险）。
-func consoleJS() string {
-	var b strings.Builder
-	for _, name := range consoleScriptNames() {
-		if raw, err := consoleAssets.ReadFile(name); err == nil {
-			b.Write(raw)
-			b.WriteByte('\n')
-		}
-	}
-	return b.String()
-}
-
-// consoleScriptNames 返回全部内嵌脚本的资源名（已排序）。
-//
-// 单独暴露的原因：契约测试要按「这个脚本属于哪个页面」分组校验 id 引用
-// （login.js 的 #loginPw 在 login.html 里，不在 index.html 里）。
-func consoleScriptNames() []string {
-	var names []string
-	for _, dir := range []string{"web/js", "web/js/render"} {
-		entries, err := consoleAssets.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".js") {
-				continue
-			}
-			names = append(names, dir+"/"+e.Name())
-		}
-	}
-	sort.Strings(names)
-	return names
-}
-
-// consoleLoginHTML 是 /login 页面标记（登录页有自己的 DOM，与 index.html 不同）。
-var consoleLoginHTML = mustConsoleAsset("web/login.html")
 
 func mustConsoleAsset(name string) []byte {
 	b, err := consoleAssets.ReadFile(name)
@@ -88,6 +39,12 @@ func consoleAssetType(name string) string {
 		return "image/x-icon"
 	case ".png":
 		return "image/png"
+	case ".svg":
+		return "image/svg+xml"
+	case ".woff2":
+		return "font/woff2"
+	case ".woff":
+		return "font/woff"
 	default:
 		return "application/octet-stream"
 	}
@@ -98,14 +55,14 @@ func consoleAssetType(name string) string {
 // 响应头刻意收紧：禁止缓存、禁止 MIME 嗅探、不发送 Referer。
 // 资源与页面同源、无外部引用，因此不需要放宽 CSP。
 func serveConsole(w http.ResponseWriter, r *http.Request) {
-	serveConsoleAsset(w, r, "web/index.html")
+	serveConsoleAsset(w, r, "web/dist/index.html")
 }
 
 // serveLogin 输出管理口令登录页（/login）。
 //
-// 与控制台同一套静态资源与响应头；页面只做一件事：验一次口令后跳到 /。
+// 与控制台使用同一构建入口，认证和导航由客户端处理。
 func serveLogin(w http.ResponseWriter, r *http.Request) {
-	serveConsoleAsset(w, r, "web/login.html")
+	serveConsoleAsset(w, r, "web/dist/index.html")
 }
 
 // consoleCSP 是控制台页面的内容安全策略。
@@ -164,10 +121,9 @@ func serveConsoleAsset(w http.ResponseWriter, r *http.Request, name string) {
 	_, _ = w.Write(raw)
 }
 
-// handleConsoleAsset 响应 /style.css、/favicon.ico、/apple-touch-icon.png 与 /js/<name>.js。
+// handleConsoleAsset 输出 Vite 资源、图标和旧版本缓存页面引用的静态资源。
 //
-// 用白名单而不是拼路径：控制台只有这两个入口，把「允许的名字」写成显式规则，
-// 就不需要再讨论 embed FS 上的路径穿越。
+// 路径按类型限定并拒绝目录或路径穿越。
 func (s *Server) handleConsoleAsset(w http.ResponseWriter, r *http.Request) {
 	p := strings.TrimPrefix(r.URL.Path, "/")
 	var name string
@@ -180,6 +136,14 @@ func (s *Server) handleConsoleAsset(w http.ResponseWriter, r *http.Request) {
 	case p == "apple-touch-icon.png":
 		// iOS 主屏图标只认 PNG（ICO 会被忽略），所以单独放一张 180×180
 		name = "web/apple-touch-icon.png"
+	case strings.HasPrefix(p, "assets/"):
+		rest := strings.TrimPrefix(p, "assets/")
+		// Vite 输出的资源位于扁平目录；不接受子目录或路径片段。
+		if rest == "" || strings.ContainsAny(rest, "/\\") || strings.Contains(rest, "..") {
+			http.NotFound(w, r)
+			return
+		}
+		name = "web/dist/assets/" + rest
 	case strings.HasPrefix(p, "js/render/"):
 		// render/ 下只允许一层扁平文件名
 		rest := strings.TrimPrefix(p, "js/render/")

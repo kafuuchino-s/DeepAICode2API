@@ -41,7 +41,8 @@ func (s *Store) Reseal() (ResealReport, error) {
 	s.mu.RLock()
 	snap := s.snapshotLocked()
 	accounts := len(s.st.Accounts)
-	stats := s.st.Stats
+	stats := s.statsSnapshotLocked()
+	statsRevision := s.statsRevision
 	s.mu.RUnlock()
 
 	rep := ResealReport{Accounts: accounts}
@@ -102,7 +103,9 @@ func (s *Store) Reseal() (ResealReport, error) {
 	s.mu.Lock()
 	s.lastSaved = append(s.lastSaved[:0], plain...)
 	s.encrypted = true
-	s.statsDirty = false
+	if s.st.Stats == stats.Stats && s.statsRevision == statsRevision {
+		s.statsDirty = false
+	}
 	s.mu.Unlock()
 
 	return rep, nil

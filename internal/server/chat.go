@@ -93,7 +93,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	transformChatResponse(out, model.ID)
-	usage := parseUsage(out["usage"])
+	usage := rl.observeUsage(out["usage"])
 	outLen := chatTextLen(out)
 
 	encoded, err := json.Marshal(out)
@@ -184,7 +184,7 @@ func (s *Server) streamChat(w http.ResponseWriter, body io.Reader, rl reqLog) {
 			return true
 		}
 		transformChatChunk(f.Object, rl.model)
-		if u := parseUsage(f.Object["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
+		if u := rl.observeUsage(f.Object["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
 			usage = u
 		}
 		outLen += chatTextLen(f.Object)

@@ -2,6 +2,7 @@ package server
 
 import (
 	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/gateway"
 	"deepaicode2api/internal/store"
 	"sync/atomic"
 	"time"
@@ -31,7 +32,17 @@ type reqLog struct {
 
 // reqLogState 是 reqLog 的跨副本共享状态。
 type reqLogState struct {
-	recorded atomic.Bool
+	recorded    atomic.Bool
+	observation gateway.UsageObservation
+}
+
+// observeUsage 同时保留协议使用的原有数值和统计需要的上报状态。
+// 一个请求的流帧由同一个处理协程顺序读取。
+func (l reqLog) observeUsage(v any) Usage {
+	if l.state != nil {
+		l.state.observation.Observe(v)
+	}
+	return parseUsage(v)
 }
 
 // newReqLog 固化一次请求的公共字段。acct 可以为 nil（尚未选到账号）。
@@ -77,6 +88,23 @@ func (l reqLog) doneStatus(status int, outLen int, usage Usage, err error) {
 		TokensOut:    usage.CompletionTokens,
 		CachedTokens: usage.CachedTokens,
 		Cost:         usage.Cost,
+	}
+	obs := l.state.observation
+	e.TokensInReported = &obs.PromptReported
+	e.TokensOutReported = &obs.CompletionReported
+	e.CachedReported = &obs.CachedReported
+	e.CostReported = &obs.CostReported
+	if obs.PromptReported {
+		e.TokensIn = obs.PromptTokens
+	}
+	if obs.CompletionReported {
+		e.TokensOut = obs.CompletionTokens
+	}
+	if obs.CachedReported {
+		e.CachedTokens = obs.CachedTokens
+	}
+	if obs.CostReported {
+		e.Cost = obs.Cost
 	}
 	if l.acct != nil {
 		e.Account = l.acct.ID
