@@ -132,6 +132,9 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 			return true
 		}
 		rewriteResponsesModel(obj, rl.model)
+		if responsesEventHasOutput(obj) {
+			rl.markFirstOutput()
+		}
 		if respObj, ok := obj["response"].(map[string]any); ok {
 			if u := rl.observeUsage(respObj["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
 				usage = u
@@ -211,6 +214,9 @@ func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, c
 			usage = u
 		}
 		d, finish := chatChunkDelta(chunk)
+		if chatDeltaHasOutput(d) {
+			rl.markFirstOutput()
+		}
 		if d.Reasoning != "" {
 			gen.reasoning(d.Reasoning)
 			outLen += len([]rune(d.Reasoning))

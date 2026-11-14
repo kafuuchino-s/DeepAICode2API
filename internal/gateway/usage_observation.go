@@ -45,7 +45,7 @@ func (o *UsageObservation) Observe(v any) {
 	if n, ok := observedNumber(cost...); ok {
 		o.Cost, o.CostReported = n, true
 	}
-	// gateway_cost 的单位和扣费含义尚未确认，不能混入原有费用。
+	// gateway_cost 独立记录，不混入旧费用，避免合并不同来源。
 	if n, ok := observedNumber(m["gateway_cost"]); ok {
 		o.GatewayCost, o.GatewayCostReported = n, true
 	}

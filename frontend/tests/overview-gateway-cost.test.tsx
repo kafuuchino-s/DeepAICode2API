@@ -42,17 +42,15 @@ describe('gateway cost in observed usage', () => {
   it('shows the reported value and coverage separately from the original cost', async () => {
     showOverview({ ...day, gateway_cost: 0.000008325, gateway_cost_reported_requests: 1 });
     const gateway = (await screen.findByText('Upstream gateway cost')).parentElement!;
-    expect(gateway.textContent).toContain('0.000008325');
+    expect(gateway.textContent).toContain('$0.000008325');
     expect(gateway.textContent).toContain('1 of 2 requests recorded');
-    expect(gateway.textContent).toContain('Unit unconfirmed');
-    expect(gateway.textContent).not.toContain('$');
     expect(screen.getByText('Reported upstream cost').parentElement?.textContent).toContain('$1.25');
   });
 
   it('shows an explicitly reported zero but leaves old data without the field unknown', async () => {
     showOverview({ ...day, gateway_cost: 0, gateway_cost_reported_requests: 1 });
     let gateway = (await screen.findByText('Upstream gateway cost')).parentElement!;
-    expect(gateway.textContent).toContain('cost0');
+    expect(gateway.textContent).toContain('cost$0');
     expect(gateway.textContent).toContain('1 of 2 requests recorded');
     cleanup();
     showOverview(day);

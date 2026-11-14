@@ -35,6 +35,15 @@ type reqLog struct {
 type reqLogState struct {
 	recorded    atomic.Bool
 	observation gateway.UsageObservation
+	ttftMS      *int64
+}
+
+// markFirstOutput 只在流式响应出现有效的模型输出时调用；心跳与角色帧不计入。
+func (l reqLog) markFirstOutput() {
+	if l.stream && l.state != nil && l.state.ttftMS == nil {
+		ms := time.Since(l.start).Milliseconds()
+		l.state.ttftMS = &ms
+	}
 }
 
 // observeUsage 同时保留协议使用的原有数值和统计需要的上报状态。
@@ -83,6 +92,7 @@ func (l reqLog) doneStatus(status int, outLen int, usage Usage, err error) {
 		Stream:       l.stream,
 		Status:       status,
 		LatencyMS:    time.Since(l.start).Milliseconds(),
+		TTFTMS:       l.state.ttftMS,
 		PromptLen:    l.inLen,
 		OutputLen:    outLen,
 		TokensIn:     usage.PromptTokens,

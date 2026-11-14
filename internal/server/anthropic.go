@@ -126,6 +126,9 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 			usage = u
 		}
 		d, finish := chatChunkDelta(chunk)
+		if chatDeltaHasOutput(d) {
+			rl.markFirstOutput()
+		}
 		if finish != "" {
 			stopReason = anthropicStopReason(finish)
 		}

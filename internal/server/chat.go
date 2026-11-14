@@ -184,6 +184,9 @@ func (s *Server) streamChat(w http.ResponseWriter, body io.Reader, rl reqLog) {
 			return true
 		}
 		transformChatChunk(f.Object, rl.model)
+		if chatChunkHasOutput(f.Object) {
+			rl.markFirstOutput()
+		}
 		if u := rl.observeUsage(f.Object["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
 			usage = u
 		}

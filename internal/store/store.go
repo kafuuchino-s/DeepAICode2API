@@ -73,6 +73,8 @@ type LogEntry struct {
 	Stream    bool   `json:"stream"`
 	Status    int    `json:"status"`
 	LatencyMS int64  `json:"latency_ms"`
+	// TTFTMS 是流式请求从开始到首个有效输出增量的时间；nil 表示不可观测。
+	TTFTMS    *int64 `json:"ttft_ms,omitempty"`
 	PromptLen int    `json:"prompt_len"`
 	OutputLen int    `json:"output_len"`
 	TokensIn  int    `json:"tokens_in"`
@@ -80,7 +82,7 @@ type LogEntry struct {
 	// CachedTokens 是上游报告的前缀缓存命中 token 数（无此字段时为 0）。
 	CachedTokens int     `json:"cached_tokens,omitempty"`
 	Cost         float64 `json:"cost"`
-	// GatewayCost 保留上游 gateway_cost 原值；nil 表示未观察到，单位尚未确认。
+	// GatewayCost 保留上游 gateway_cost 原值，按美元展示；nil 表示未观察到。
 	GatewayCost *float64 `json:"gateway_cost,omitempty"`
 	// nil 表示旧记录没有上报状态；false 是本次未上报，true 包括显式的零。
 	TokensInReported  *bool  `json:"tokens_in_reported,omitempty"`

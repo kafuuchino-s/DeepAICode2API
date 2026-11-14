@@ -6,6 +6,7 @@ export type LogEntry = {
   stream?: boolean;
   status: number;
   latency_ms?: number;
+  ttft_ms?: number;
   prompt_len?: number;
   output_len?: number;
   tokens_in?: number;
@@ -81,6 +82,21 @@ export function observedValue(value: number | undefined, known?: boolean): numbe
   return typeof value === 'number' && Number.isFinite(value) && value !== 0 ? value : null;
 }
 
+export function observedDuration(value: number | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+// 首次输出后的平均速度是近似值；历史记录没有明确上报标记时不能推算。
+export function estimatedOutputTps(log: Pick<LogEntry, 'stream' | 'ttft_ms' | 'latency_ms' | 'tokens_out' | 'tokens_out_reported'>): number | null {
+  const first = observedDuration(log.ttft_ms);
+  const total = observedDuration(log.latency_ms);
+  const output = log.tokens_out;
+  if (log.stream !== true || first === null || total === null || total <= first ||
+      log.tokens_out_reported !== true || typeof output !== 'number' || !Number.isFinite(output) || output < 2) return null;
+  const rate = (output - 1) * 1000 / (total - first);
+  return Number.isFinite(rate) ? rate : null;
+}
+
 export function formatCost(value: number | undefined, known: boolean | undefined, unknown: string): string {
   const observed = observedValue(value, known);
   if (observed === null) return unknown;
@@ -94,7 +110,7 @@ export function observedGatewayCost(value: number | undefined): number | null {
 
 export function formatGatewayCost(value: number | undefined, unknown: string): string {
   const observed = observedGatewayCost(value);
-  return observed === null ? unknown : String(observed);
+  return observed === null ? unknown : `$${observed}`;
 }
 
 export function logOutcome(entry: Pick<LogEntry, 'status' | 'err'>): 'client-gone' | 'failed' | 'success' {

@@ -140,6 +140,9 @@ func chatChunkDelta(chunk map[string]any) (chatDelta, string) {
 	}
 
 	d.Reasoning, _ = delta["reasoning"].(string)
+	if d.Reasoning == "" {
+		d.Reasoning, _ = delta["reasoning_content"].(string)
+	}
 	d.Content, _ = delta["content"].(string)
 	tcs, ok := delta["tool_calls"].([]any)
 	if !ok {
@@ -159,4 +162,53 @@ func chatChunkDelta(chunk map[string]any) (chatDelta, string) {
 		d.ToolCalls = append(d.ToolCalls, td)
 	}
 	return d, finish
+}
+
+// chatDeltaHasOutput 判断转换路径是否真的会发出模型生成的增量。
+func chatDeltaHasOutput(d chatDelta) bool {
+	if d.Reasoning != "" || d.Content != "" {
+		return true
+	}
+	for _, tc := range d.ToolCalls {
+		if tc.Name != "" || tc.Args != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// chatChunkHasOutput 覆盖透传的全部 choices，包括拒答和旧式函数调用。
+func chatChunkHasOutput(chunk map[string]any) bool {
+	choices, _ := chunk["choices"].([]any)
+	for _, choice := range choices {
+		cm, _ := choice.(map[string]any)
+		delta, _ := cm["delta"].(map[string]any)
+		for _, key := range []string{"content", "reasoning", "reasoning_content", "refusal"} {
+			if text, _ := delta[key].(string); text != "" {
+				return true
+			}
+		}
+		if fn, _ := delta["function_call"].(map[string]any); fn != nil && (strOf(fn["name"]) != "" || strOf(fn["arguments"]) != "") {
+			return true
+		}
+		calls, _ := delta["tool_calls"].([]any)
+		for _, call := range calls {
+			tc, _ := call.(map[string]any)
+			fn, _ := tc["function"].(map[string]any)
+			if strOf(fn["name"]) != "" || strOf(fn["arguments"]) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// responsesEventHasOutput 忽略 created、心跳、完成状态及空增量。
+func responsesEventHasOutput(obj map[string]any) bool {
+	typ := strOf(obj["type"])
+	if typ == "response.output_item.added" {
+		item, _ := obj["item"].(map[string]any)
+		return strOf(item["type"]) == "function_call" && (strOf(item["name"]) != "" || strOf(item["arguments"]) != "")
+	}
+	return strings.HasSuffix(typ, ".delta") && strOf(obj["delta"]) != ""
 }

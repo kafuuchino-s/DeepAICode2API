@@ -38,6 +38,24 @@ func TestLogsPersistAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestTTFTZeroAndMissingSurviveRestart(t *testing.T) {
+	st := newStore(t)
+	zero := int64(0)
+	st.Record(LogEntry{Status: 200, Model: "missing"}, 0)
+	st.Record(LogEntry{Status: 200, Model: "zero", TTFTMS: &zero}, 0)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := reopened.Logs(0)
+	if len(logs) != 2 || logs[0].Model != "zero" || logs[0].TTFTMS == nil || *logs[0].TTFTMS != 0 || logs[1].Model != "missing" || logs[1].TTFTMS != nil {
+		t.Fatalf("missing and explicit zero TTFT = %+v", logs)
+	}
+}
+
 // 主状态文件不应再包含 logs / stats；统计落到自己的小文件。
 func TestStateFileExcludesLogsAndStats(t *testing.T) {
 	dir := t.TempDir()

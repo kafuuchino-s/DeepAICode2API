@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { emptyFilters, filtersFromHash, filtersToHash, filtersToQuery, formatCost, logOutcome, observedValue } from './log-utils.ts';
+import { emptyFilters, estimatedOutputTps, filtersFromHash, filtersToHash, filtersToQuery, formatCost, logOutcome, observedDuration, observedValue } from './log-utils.ts';
 
 test('log links retain the filters and translate local time for the API', () => {
   const filters = { ...emptyFilters, endpoint: 'responses', account: 'a+b@example.com', min_status: '400', q: '错误 & model', since: '2026-01-02T15:30', limit: '50' };
@@ -30,6 +30,27 @@ test('cost text preserves tiny charges while distinguishing reported zero and un
   assert.equal(formatCost(0, true, 'Unknown'), '$0.000000');
   assert.equal(formatCost(0.000000000001, true, 'Unknown'), '$1e-12');
   assert.equal(formatCost(0.25, false, 'Unknown'), 'Unknown');
+});
+
+test('output speed requires measured timing and explicitly reported output usage', () => {
+  const entry = { stream: true, ttft_ms: 150, latency_ms: 2150, tokens_out: 51, tokens_out_reported: true };
+  assert.equal(estimatedOutputTps(entry), 25);
+  assert.equal(estimatedOutputTps({ ...entry, ttft_ms: 0, latency_ms: 2000, tokens_out: 11 }), 5);
+  assert.equal(estimatedOutputTps({ ...entry, stream: false }), null);
+  assert.equal(estimatedOutputTps({ ...entry, ttft_ms: undefined }), null);
+  assert.equal(estimatedOutputTps({ ...entry, latency_ms: undefined }), null);
+  assert.equal(estimatedOutputTps({ ...entry, tokens_out_reported: undefined }), null);
+  assert.equal(estimatedOutputTps({ ...entry, tokens_out_reported: false }), null);
+  assert.equal(estimatedOutputTps({ ...entry, tokens_out: undefined }), null);
+  assert.equal(estimatedOutputTps({ ...entry, tokens_out: 1 }), null);
+  assert.equal(estimatedOutputTps({ ...entry, latency_ms: 150 }), null);
+  assert.equal(estimatedOutputTps({ ...entry, latency_ms: 149 }), null);
+  assert.equal(estimatedOutputTps({ ...entry, ttft_ms: -1 }), null);
+  assert.equal(estimatedOutputTps({ ...entry, ttft_ms: Number.NaN }), null);
+  assert.equal(estimatedOutputTps({ ...entry, latency_ms: Number.POSITIVE_INFINITY }), null);
+  assert.equal(estimatedOutputTps({ ...entry, tokens_out: Number.NaN }), null);
+  assert.equal(observedDuration(0), 0);
+  assert.equal(observedDuration(undefined), null);
 });
 
 test('499 is not a failure even with an error; an error with 200 is a failure', () => {

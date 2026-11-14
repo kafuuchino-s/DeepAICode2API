@@ -187,7 +187,7 @@ describe('request log usage', () => {
     ] }))));
     history.replaceState(null, '', '/#logs');
     renderPage(<LogsPage />);
-    const usage = async (model: string) => (await screen.findByRole('row', { name: new RegExp(model) })).querySelectorAll('td')[4].textContent;
+    const usage = async (model: string) => (await screen.findByRole('row', { name: new RegExp(model) })).querySelectorAll('td')[3].textContent;
     expect(await usage('missing')).toContain('InUnknownOutUnknown');
     expect(await usage('zero')).toContain('In0Out0');
     expect(await usage('history')).toContain('In42OutUnknown');
