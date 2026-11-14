@@ -16,12 +16,11 @@ func TestObservedUsageAcrossProtocols(t *testing.T) {
 		for _, stream := range []bool{false, true} {
 			for _, reported := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/stream=%t/reported=%t", protocol, stream, reported), func(t *testing.T) {
-					cacheCost := ""
-					if reported {
-						cacheCost = `,"prompt_tokens_details":{"cached_tokens":0},"cost":0`
-					}
-					if protocol == "responses-native" && reported {
-						cacheCost = `,"input_tokens_details":{"cached_tokens":0},"cost_details":{"upstream_inference_cost":0}`
+					cacheCost := `,"gateway_cost":0.000008325`
+					if reported && protocol == "responses-native" {
+						cacheCost += `,"input_tokens_details":{"cached_tokens":0},"cost_details":{"upstream_inference_cost":0}`
+					} else if reported {
+						cacheCost += `,"prompt_tokens_details":{"cached_tokens":0},"cost":0`
 					}
 					u := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 						if protocol == "responses-native" {
@@ -55,12 +54,19 @@ func TestObservedUsageAcrossProtocols(t *testing.T) {
 						t.Fatalf("response %d: %s", rec.Code, rec.Body.String())
 					}
 					logs := s.Store.Logs(1)
-					if len(logs) != 1 || logs[0].TokensIn != 10 || logs[0].TokensOut != 5 || logs[0].CachedReported == nil || *logs[0].CachedReported != reported || logs[0].CostReported == nil || *logs[0].CostReported != reported {
+					if len(logs) != 1 || logs[0].TokensIn != 10 || logs[0].TokensOut != 5 || logs[0].CachedReported == nil || *logs[0].CachedReported != reported || logs[0].CostReported == nil || *logs[0].CostReported != reported || logs[0].GatewayCost == nil || *logs[0].GatewayCost != 0.000008325 {
 						t.Fatalf("log = %+v", logs)
+					}
+					response := do(t, s, http.MethodGet, "/admin/api/logs?limit=1", "", "")
+					payload := decodeJSON[struct {
+						Logs []store.LogEntry `json:"logs"`
+					}](t, response.Body.Bytes())
+					if response.Code != http.StatusOK || len(payload.Logs) != 1 || payload.Logs[0].GatewayCost == nil || *payload.Logs[0].GatewayCost != 0.000008325 {
+						t.Fatalf("admin logs = %d %s", response.Code, response.Body.String())
 					}
 					trend := s.Store.TrendDays(1)
 					d := trend.Days[0]
-					if d.Requests != 1 || d.TokensIn != 10 || d.TokensOut != 5 || (d.CacheReportedRequests == 1) != reported || (d.CostReportedRequests == 1) != reported {
+					if d.Requests != 1 || d.TokensIn != 10 || d.TokensOut != 5 || (d.CacheReportedRequests == 1) != reported || (d.CostReportedRequests == 1) != reported || d.GatewayCostReportedRequests != 1 || d.GatewayCost != 0.000008325 || d.Cost != 0 || s.Store.Stats().TotalCost != 0 {
 						t.Fatalf("trend = %+v", d)
 					}
 				})

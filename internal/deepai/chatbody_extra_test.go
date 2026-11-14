@@ -57,8 +57,10 @@ func TestEnsureSystemMessageAddsOnlyWhenMissing(t *testing.T) {
 // TestQuotaExhaustedDetectionAndReset 覆盖 403 theos_exhausted 的识别与恢复时间。
 func TestQuotaExhaustedDetectionAndReset(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	body := `{"error":{"message":"You've used today's Theos. They refresh at 2026-11-14T00:05:52+00:00.",` +
-		`"type":"theos_exhausted","code":"theos_exhausted","refresh_at":"2026-11-14T00:05:52+00:00"}}`
+	want := now.Add(time.Hour)
+	refresh := want.Format(time.RFC3339)
+	body := `{"error":{"message":"You've used today's Theos. They refresh at ` + refresh + `.",` +
+		`"type":"theos_exhausted","code":"theos_exhausted","refresh_at":"` + refresh + `"}}`
 	e := mustErr(t, http.StatusForbidden, body)
 	if !e.QuotaExhausted() {
 		t.Fatal("应识别为 theos_exhausted")
@@ -66,7 +68,6 @@ func TestQuotaExhaustedDetectionAndReset(t *testing.T) {
 	if e.SocialLoginRequired() || e.EmailUnverified() || e.MachineRequired() {
 		t.Fatal("不应误判为其它账号终态")
 	}
-	want, _ := time.Parse(time.RFC3339, "2026-11-14T00:05:52+00:00")
 	if got := e.QuotaResetAt(6*time.Hour, now); !got.Equal(want) {
 		t.Fatalf("恢复时间 = %v，期望 %v", got, want)
 	}

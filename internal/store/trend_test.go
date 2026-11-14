@@ -56,7 +56,8 @@ func TestTrendLegacyStatsAndEncryptedRestart(t *testing.T) {
 	if len(before.Days) != 1 || before.Days[0].Requests != 0 || st.Stats().TotalRequests != 33 {
 		t.Fatalf("legacy migration = %+v / %+v", before, st.Stats())
 	}
-	st.Record(LogEntry{Status: 200, TokensIn: 20, TokensInReported: boolValue(true), CachedTokens: 5, CachedReported: boolValue(true), Cost: 0.125, CostReported: boolValue(true)}, 0)
+	gatewayCost := 0.000008325
+	st.Record(LogEntry{Status: 200, TokensIn: 20, TokensInReported: boolValue(true), CachedTokens: 5, CachedReported: boolValue(true), Cost: 0.125, CostReported: boolValue(true), GatewayCost: &gatewayCost}, 0)
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -72,17 +73,39 @@ func TestTrendLegacyStatsAndEncryptedRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	after := reopened.TrendDays(30)
-	if after.StartedAt != before.StartedAt || len(after.Days) != 1 || after.Days[0].Requests != 1 || after.Days[0].CachedTokens != 5 || after.Days[0].Cost != 0.125 || reopened.Stats().TotalRequests != 34 {
+	if after.StartedAt != before.StartedAt || len(after.Days) != 1 || after.Days[0].Requests != 1 || after.Days[0].CachedTokens != 5 || after.Days[0].Cost != 0.125 || after.Days[0].GatewayCost != gatewayCost || after.Days[0].GatewayCostReportedRequests != 1 || reopened.Stats().TotalRequests != 34 || reopened.Stats().TotalCost != 1.375 {
 		t.Fatalf("restart = %+v / %+v", after, reopened.Stats())
 	}
 	logs := reopened.QueryLogs(QueryFilter{Limit: 10})
-	if len(logs) != 1 || !reported(logs[0].CachedReported) || !reported(logs[0].CostReported) {
+	if len(logs) != 1 || !reported(logs[0].CachedReported) || !reported(logs[0].CostReported) || logs[0].GatewayCost == nil || *logs[0].GatewayCost != gatewayCost {
 		t.Fatalf("encrypted log metadata = %+v", logs)
 	}
 	// 旧日志不含布尔字段，仍可读取且保持未知状态。
 	var legacy LogEntry
-	if err := json.Unmarshal([]byte(`{"status":200,"cost":0}`), &legacy); err != nil || legacy.CostReported != nil || legacy.CachedReported != nil {
+	if err := json.Unmarshal([]byte(`{"status":200,"cost":0}`), &legacy); err != nil || legacy.CostReported != nil || legacy.CachedReported != nil || legacy.GatewayCost != nil {
 		t.Fatalf("legacy log = %+v, err=%v", legacy, err)
+	}
+}
+
+func TestGatewayCostZeroAndMissingSurviveRestart(t *testing.T) {
+	st := newStore(t)
+	zero := 0.0
+	st.Record(LogEntry{Status: 200, Model: "missing"}, 0)
+	st.Record(LogEntry{Status: 200, Model: "zero", GatewayCost: &zero}, 0)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := reopened.Logs(0)
+	if len(logs) != 2 || logs[0].Model != "zero" || logs[0].GatewayCost == nil || *logs[0].GatewayCost != 0 || logs[1].Model != "missing" || logs[1].GatewayCost != nil {
+		t.Fatalf("missing and explicit zero = %+v", logs)
+	}
+	day := reopened.TrendDays(1).Days[0]
+	if day.GatewayCostReportedRequests != 1 || day.GatewayCost != 0 || day.CostReportedRequests != 0 {
+		t.Fatalf("gateway zero trend = %+v", day)
 	}
 }
 

@@ -15,6 +15,8 @@ export type TrendDay = {
   cache_paired_input_tokens: number;
   cost: number;
   cost_reported_requests: number;
+  gateway_cost?: number;
+  gateway_cost_reported_requests?: number;
 };
 export type Trend = { started_at: number; generated_at: number; timezone: string; days: TrendDay[] };
 
@@ -34,7 +36,9 @@ export function summarize(days: TrendDay[]) {
     pairedInput: a.pairedInput + d.cache_paired_input_tokens,
     cost: a.cost + d.cost,
     costReported: a.costReported + d.cost_reported_requests,
-  }), { requests: 0, failed: 0, clientGone: 0, tokensIn: 0, tokensOut: 0, inputReported: 0, outputReported: 0, cachedTokens: 0, cacheReported: 0, paired: 0, pairedCached: 0, pairedInput: 0, cost: 0, costReported: 0 });
+    gatewayCost: a.gatewayCost + (d.gateway_cost ?? 0),
+    gatewayCostReported: a.gatewayCostReported + (d.gateway_cost_reported_requests ?? 0),
+  }), { requests: 0, failed: 0, clientGone: 0, tokensIn: 0, tokensOut: 0, inputReported: 0, outputReported: 0, cachedTokens: 0, cacheReported: 0, paired: 0, pairedCached: 0, pairedInput: 0, cost: 0, costReported: 0, gatewayCost: 0, gatewayCostReported: 0 });
 }
 
 // A reported zero is a value; zero samples means the source supplied no value.

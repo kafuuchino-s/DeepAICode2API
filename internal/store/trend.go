@@ -8,22 +8,24 @@ import (
 // TrendDay 只统计启用日汇总以后实际记录的请求，不由有限的日志反推。
 // Token 和费用均只累加上游明确提供的字段。缓存比例须使用配对样本。
 type TrendDay struct {
-	Date                   string  `json:"date"`
-	Partial                bool    `json:"partial"`
-	Requests               int64   `json:"requests"`
-	Failed                 int64   `json:"failed"`
-	ClientGone             int64   `json:"client_gone"`
-	TokensIn               int64   `json:"tokens_in"`
-	TokensOut              int64   `json:"tokens_out"`
-	InputReportedRequests  int64   `json:"input_reported_requests"`
-	OutputReportedRequests int64   `json:"output_reported_requests"`
-	CachedTokens           int64   `json:"cached_tokens"`
-	CacheReportedRequests  int64   `json:"cache_reported_requests"`
-	CachePairedRequests    int64   `json:"cache_paired_requests"`
-	CachePairedTokens      int64   `json:"cache_paired_tokens"`
-	CachePairedInputTokens int64   `json:"cache_paired_input_tokens"`
-	Cost                   float64 `json:"cost"`
-	CostReportedRequests   int64   `json:"cost_reported_requests"`
+	Date                        string  `json:"date"`
+	Partial                     bool    `json:"partial"`
+	Requests                    int64   `json:"requests"`
+	Failed                      int64   `json:"failed"`
+	ClientGone                  int64   `json:"client_gone"`
+	TokensIn                    int64   `json:"tokens_in"`
+	TokensOut                   int64   `json:"tokens_out"`
+	InputReportedRequests       int64   `json:"input_reported_requests"`
+	OutputReportedRequests      int64   `json:"output_reported_requests"`
+	CachedTokens                int64   `json:"cached_tokens"`
+	CacheReportedRequests       int64   `json:"cache_reported_requests"`
+	CachePairedRequests         int64   `json:"cache_paired_requests"`
+	CachePairedTokens           int64   `json:"cache_paired_tokens"`
+	CachePairedInputTokens      int64   `json:"cache_paired_input_tokens"`
+	Cost                        float64 `json:"cost"`
+	CostReportedRequests        int64   `json:"cost_reported_requests"`
+	GatewayCost                 float64 `json:"gateway_cost"`
+	GatewayCostReportedRequests int64   `json:"gateway_cost_reported_requests"`
 }
 
 type trendState struct {
@@ -95,6 +97,10 @@ func (s *Store) recordTrendLocked(e LogEntry, now time.Time) {
 	if reported(e.CostReported) {
 		d.CostReportedRequests++
 		d.Cost += e.Cost
+	}
+	if e.GatewayCost != nil {
+		d.GatewayCostReportedRequests++
+		d.GatewayCost += *e.GatewayCost
 	}
 	s.trend.Days[date] = d
 	s.statsRevision++

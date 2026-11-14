@@ -14,6 +14,7 @@ export type LogEntry = {
   tokens_out_reported?: boolean;
   cached_tokens?: number;
   cost?: number;
+  gateway_cost?: number;
   cached_tokens_known?: boolean;
   cost_known?: boolean;
   err?: string;
@@ -84,6 +85,16 @@ export function formatCost(value: number | undefined, known: boolean | undefined
   const observed = observedValue(value, known);
   if (observed === null) return unknown;
   return `$${observed === 0 ? observed.toFixed(6) : String(observed)}`;
+}
+
+// 上游网关成本以字段是否存在区分未知和零，不能沿用旧成本的 presence 规则。
+export function observedGatewayCost(value: number | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+export function formatGatewayCost(value: number | undefined, unknown: string): string {
+  const observed = observedGatewayCost(value);
+  return observed === null ? unknown : String(observed);
 }
 
 export function logOutcome(entry: Pick<LogEntry, 'status' | 'err'>): 'client-gone' | 'failed' | 'success' {

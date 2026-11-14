@@ -107,6 +107,9 @@ func (l reqLog) doneStatus(status int, outLen int, usage Usage, err error) {
 	if obs.CostReported {
 		e.Cost = obs.Cost
 	}
+	if obs.GatewayCostReported {
+		e.GatewayCost = &obs.GatewayCost
+	}
 	if l.acct != nil {
 		e.Account = l.acct.ID
 	}

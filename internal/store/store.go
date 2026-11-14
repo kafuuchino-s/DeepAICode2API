@@ -80,6 +80,8 @@ type LogEntry struct {
 	// CachedTokens 是上游报告的前缀缓存命中 token 数（无此字段时为 0）。
 	CachedTokens int     `json:"cached_tokens,omitempty"`
 	Cost         float64 `json:"cost"`
+	// GatewayCost 保留上游 gateway_cost 原值；nil 表示未观察到，单位尚未确认。
+	GatewayCost *float64 `json:"gateway_cost,omitempty"`
 	// nil 表示旧记录没有上报状态；false 是本次未上报，true 包括显式的零。
 	TokensInReported  *bool  `json:"tokens_in_reported,omitempty"`
 	TokensOutReported *bool  `json:"tokens_out_reported,omitempty"`

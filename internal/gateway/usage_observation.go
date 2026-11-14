@@ -9,9 +9,10 @@ import (
 // 统计则必须区分上游明确给出的零和未提供的字段。
 type UsageObservation struct {
 	PromptTokens, CompletionTokens, CachedTokens int
-	Cost                                         float64
+	Cost, GatewayCost                            float64
 	PromptReported, CompletionReported           bool
 	CachedReported, CostReported                 bool
+	GatewayCostReported                          bool
 }
 
 // Observe 合并一帧上游用量。流式响应可能把不同字段放在不同帧；只替换
@@ -43,6 +44,10 @@ func (o *UsageObservation) Observe(v any) {
 	}
 	if n, ok := observedNumber(cost...); ok {
 		o.Cost, o.CostReported = n, true
+	}
+	// gateway_cost 的单位和扣费含义尚未确认，不能混入原有费用。
+	if n, ok := observedNumber(m["gateway_cost"]); ok {
+		o.GatewayCost, o.GatewayCostReported = n, true
 	}
 }
 
