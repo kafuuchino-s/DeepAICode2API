@@ -60,7 +60,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !stream {
 		// 非流式请求受配置的整体超时约束，允许上游长思考的首字节预算生效。
 		var cancel context.CancelFunc
-		ctx, cancel = contextWithTimeout(r, s.requestTimeout())
+		ctx, cancel = httpx.ContextWithTimeout(r, s.requestTimeout())
 		defer cancel()
 	}
 	resp, acct, err := s.openModel(ctx, deepai.PathChat, body, affinity, group, key, stream, !modelRequiresPaidQuota(model))

@@ -26,7 +26,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 双协议 | OpenAI `/v1/chat/completions`、`/v1/responses`；Anthropic `/v1/messages` |
-| 协议对齐 | 车道 5 + `X-DeepAI-Code-Instance` + `/theos` 签到；区分 `social_login_required` / `machine_required` / `lane_version_unsupported` |
+| 协议对齐 | 车道 6 + `X-DeepAI-Code-Instance` + `/theos` 签到；区分 `social_login_required` / `machine_required` / `lane_version_unsupported` |
 | 号池治理 | 分组轮询、失败换号、容量退避、按账号配额调度、策略拦截自动跳过 |
 | 账号接入 | 浏览器登录（Google / Apple / 邮箱密码）、桌面端凭据导入、手工 API Key；入池自动分配机器指纹与代理 |
 | 控制台 | 单页内嵌 UI：账号 / 密钥 / 日志 / 统计 / 设置 |
@@ -49,9 +49,9 @@
 
 ## 一、逆向结论
 
-DeepAI Code 是 **Electron + 本地 t3code server** 架构（应用版本 **0.3.36**，车道 5；
-0.3.20 → 0.3.30 → 0.3.32 → 0.3.35 → 0.3.36 的 wire protocol 逐项比对：
-**0.3.36 只抬了车道（4 → 5），其余请求头 / 指纹 / 签到 / 端点未变**）。
+DeepAI Code 是 **Electron + 本地 t3code server** 架构（应用版本 **0.3.37**，车道 6；
+0.3.20 → 0.3.30 → 0.3.32 → 0.3.35 → 0.3.36 → 0.3.37 的 wire protocol 逐项比对：
+**0.3.37 将车道从 5 提到 6，并更新了车道探测和部分工具调用顺序**）。
 真正干活的不是桌面壳，而是 `resources/server.asar` 里的 t3code server；
 它把上游能力封装成本地回环 HTTP 服务，再交给 Pi（编码 agent）调用。
 
@@ -71,7 +71,7 @@ DeepAI Code 是 **Electron + 本地 t3code server** 架构（应用版本 **0.3.
 | 语音转写 | `POST https://api.deepai.org/speech_to_text`（字段 `voiceRecording`） |
 | 联网搜索 | `POST https://api.deepai.org/deepai_code/web_search` |
 | **鉴权** | 请求头 `Api-Key: <apiKey>`（不是 `Authorization`） |
-| 协议头 | `X-DeepAI-Code-Theos: 5`（计费车道版本；0.3.36 起为 5，推理端点 4 / 5 都接受，`/models` 放宽到 1–5，见 `docs/recon.md` §3） |
+| 协议头 | `X-DeepAI-Code-Theos: 6`（计费车道版本；0.3.37 起为 6，推理端点及 `/models` 探测会从当前车道开始尝试回退，见 `docs/recon.md` §3） |
 | 进程实例 | `X-DeepAI-Code-Instance: <32 位 hex>`（每个出口代理随机一次，随该代理的所有 JSON 请求发出；桌面端是每进程一次） |
 | 签到 | `/theos` 响应带 `check_in:{nonce, seconds}`；下次 `/theos` 回传 `X-DeepAI-Code-Check-In` 与 `X-DeepAI-Code-Beacon: v=…;up=…;pi=0\|1`（`focus` 只在焦点状态已知时才追加） |
 | **机器指纹** | `X-DeepAI-Code-Machine: sha256(原始机器 UUID)`，用于按天发放免费 Theos；计量模型缺失时回 `machine_required` |
@@ -115,9 +115,8 @@ OpenRouter 风格的 `provider`、`reasoning`、`reasoning_details`、`cost` 等
 ## 二、支持的模型
 
 模型目录**完全由上游下发**：网关只做缓存与别名，上游新增或下线模型都无需改代码。
-下表是 2026-11-13 从线上 `/v1/models` 导出的**实时目录**（21 个：10 免费 / 11 付费），
-`Theos/次` 取自上游 `theosPerRequest`（字符串），`0` 即免费。控制台「模型目录」页读的是同一份数据。
-（上一版快照里的 `crouton-alpha` 已被上游下线；`gpt-oss-120b` 客户端会主动过滤，网关也不展示。）
+下表保留 2026-11-13 从线上 `/v1/models` 导出的旧快照（21 个：10 免费 / 11 付费），
+`Theos/次` 取自上游 `theosPerRequest`（字符串），`0` 即免费。当前上游目录已经更新到27个，新增模型以控制台实时目录为准；网关会使用启用账号凭据刷新目录。
 
 | ID | 名称 | 上下文 | 最大输出 | Theos/次 | 说明 |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -621,9 +620,9 @@ docker run -d --name deepaicode2api \
   deepaicode2api
 ```
 
-> `X-DeepAI-Code-Theos: 5` 是当前客户端（0.3.36）的车道：`/chat/completions` 上
-> 4 / 5 都回 200，更旧的 2/3 与更高的 6+ 回 `426 lane_version_unsupported`
-> （`/models` 放宽到 1–5，见 `docs/recon.md` §3）。
+> `X-DeepAI-Code-Theos: 6` 是当前客户端（0.3.37）的车道：`/chat/completions` 上
+> 6 优先，探测会向上猜测更新车道并向下回退；不兼容时返回 `426 lane_version_unsupported`。
+> `/models` 现在必须带账号 `Api-Key`，网关会借用启用账号做目录、车道和预热探测。
 > `X-DeepAI-Code-Machine` 仍是计量模型的必需头：缺失时返回 `400 machine_required`。
 > 容器里通常读不到宿主机的 SMBIOS UUID，因此 `DEEPAI_MACHINE_ID` 在容器部署时**必填**。
 > 填桌面端所在机器的原始 UUID 即可复用同一份每日免费额度。
@@ -673,8 +672,8 @@ go build -ldflags "-X main.version=v0.1.2" -o bin/deepaicode2api .
 
 ## 十、限制与说明
 
-- 默认 `X-DeepAI-Code-Theos: 5`（0.3.36 起；2026-11-13 复核推理端点接受 4 / 5，元数据端点接受 1–5，别用 `/models` 判断上游推理可用性）；推理端点车道不符返回 426 `lane_version_unsupported`；
-- 心跳 `X-DeepAI-Code-Beacon` 的 `v=` 必须是当前客户端版本（现为 **0.3.36**，见 `deepai.AppVersion`）；`pi=` 在 0.3.30 起是可选的，但发了不会错；
+- 默认 `X-DeepAI-Code-Theos: 6`（0.3.37 起；探测从当前车道开始，并向上猜测更新车道、向下回退）；推理端点车道不符返回 426 `lane_version_unsupported`；
+- 心跳 `X-DeepAI-Code-Beacon` 的 `v=` 必须是当前客户端版本（现为 **0.3.37**，见 `deepai.AppVersion`）；`pi=` 在 0.3.30 起是可选的，但发了不会错；
 - 推理请求按桌面端实测值发 `user-agent: node`、`accept: */*`、`accept-language: *`，不带 Chrome UA 或 `sec-ch-ua` 指纹；
 - `X-DeepAI-Code-Machine` 缺失时计量模型返回 `machine_required`，因此无 SMBIOS 的环境必须设置 `DEEPAI_MACHINE_ID`；
 - 0.3.19 曾把推理收窄到 **Google/Apple 登录**的账号（邮箱密码号 `403
@@ -690,10 +689,7 @@ go build -ldflags "-X main.version=v0.1.2" -o bin/deepaicode2api .
 - **不实现托管主机控制面** `/deepai_code/connect/*`（设备注册 / 远程主机 / TLS 中继）：
   它要 Ed25519 + X25519 双密钥设备身份与受管主机生命周期，服务的是桌面端
   「把机器变成受管主机」功能，与推理无关（逆向细节见 `docs/recon.md` §2.1）；
-- 模型目录与车道探测**刻意不带凭据**：网关的 `GET /deepai_code/models` 只发车道头 +
-  机器指纹（代理预热 / 车道探测都走它）。桌面端 0.3.36 会给 `/models` 带 `Api-Key`，
-  但目录不随账号变化（带/不带返回同一份），把密钥发到一个本来匿名就能用的
-  端点上没有收益（见 `docs/recon.md` §2）；
+- 模型目录和车道探测会借用一个启用账号的 `Api-Key`：网关的 `GET /deepai_code/models` 现在不带凭据会返回 401，目录、车道和预热探测使用 `probeAccount()` 选择的账号；
 - `/v1/messages/count_tokens` 是字符数估算，不是上游真实 tokenizer；
 - 状态文件默认明文保存上游 API Key（与桌面端一致）；配置
   `DEEPAI2API_MASTER_KEY` 后整文件加密，请务必保证主密钥不随备份泄露；
