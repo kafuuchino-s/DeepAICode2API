@@ -233,6 +233,17 @@ func (s *Server) RefreshModels(ctx context.Context) ([]deepai.Model, error) {
 	}
 	models, def, err := s.Up.FetchModels(ctx, acct)
 	if err != nil {
+		// 上游抬高车道后，目录刷新可能先撞到旧车道。先探测并切换，
+		// 再在同一个刷新周期重试一次，避免长期只使用旧缓存。
+		var he *deepai.HTTPError
+		before := s.CurrentLane()
+		if errors.As(err, &he) && he.LaneUnsupported() {
+			if lane, laneErr := s.RefreshLane(ctx); laneErr == nil && lane != "" && lane != before {
+				models, def, err = s.Up.FetchModels(ctx, acct)
+			}
+		}
+	}
+	if err != nil {
 		return nil, err
 	}
 	s.Store.SetModels(models, def)

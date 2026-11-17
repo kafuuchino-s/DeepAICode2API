@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -209,6 +210,41 @@ func TestRefreshModelsSendsAccountKey(t *testing.T) {
 	}
 	if key := u.last(t).Header.Get(deepai.HeaderKeyName); key != "upstream-key" {
 		t.Fatalf("拉目录的 Api-Key = %q，期望 upstream-key", key)
+	}
+}
+
+// RefreshModels 在模型目录先撞到旧车道时，应先完成车道探测并重试同一轮刷新。
+func TestRefreshModelsRetriesAfterLaneUpgrade(t *testing.T) {
+	u := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != deepai.ModelBasePath+deepai.PathModels {
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		if r.Header.Get(deepai.HeaderLane) != "7" {
+			w.WriteHeader(http.StatusUpgradeRequired)
+			_, _ = io.WriteString(w, `{"error":{"code":"lane_version_unsupported","message":"update"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, modelsForWarmup)
+	})
+	s, _ := newTestServer(t, u)
+
+	models, err := s.RefreshModels(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshModels: %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "m1" {
+		t.Fatalf("刷新后的目录异常: %#v", models)
+	}
+	if got := s.CurrentLane(); got != "7" {
+		t.Fatalf("CurrentLane = %q，期望 7", got)
+	}
+	if got := u.last(t).Header.Get(deepai.HeaderLane); got != "7" {
+		t.Fatalf("最终目录请求车道 = %q，期望 7", got)
+	}
+	if got := countPath(u, deepai.ModelBasePath+deepai.PathModels); got != 4 {
+		t.Fatalf("车道失败后的请求数 = %d，期望初次目录 + 两次探测 + 重试", got)
 	}
 }
 

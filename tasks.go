@@ -18,6 +18,11 @@ func background(st *store.Store, srv *server.Server, stop <-chan struct{}) {
 	// 用独立 ctx：即使 stop 关闭也让它自己超时结束，不阻塞退出流程。
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if lane, err := srv.RefreshLane(ctx); err != nil {
+			log.Printf("车道探测失败（沿用 %s）: %v", srv.CurrentLane(), err)
+		} else {
+			log.Printf("车道版本: %s（账号凭据 /models 探测）", lane)
+		}
 		models, err := srv.RefreshModels(ctx)
 		cancel()
 		if err != nil {
