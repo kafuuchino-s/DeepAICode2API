@@ -16,169 +16,14 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"deepaicode2api/internal/configenv"
+	"deepaicode2api/internal/machine"
+	"deepaicode2api/internal/proxy"
 )
 
 // maxJSONBytes 限制上游 JSON 响应体大小（模型目录 / 配额 / 搜索）。
 const maxJSONBytes = 8 << 20
-
-// HTTPError 是上游返回的非 2xx 响应。
-type HTTPError struct {
-	Op     string
-	Status int
-	Body   []byte
-}
-
-// Error 返回可读错误信息（优先使用上游 error.message）。
-func (e *HTTPError) Error() string {
-	var payload struct {
-		Error struct {
-			Message string `json:"message"`
-			Type    string `json:"type"`
-			Code    string `json:"code"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(e.Body, &payload) == nil && payload.Error.Message != "" {
-		return fmt.Sprintf("%s: %s", e.Op, payload.Error.Message)
-	}
-	body := strings.TrimSpace(string(e.Body))
-	if len(body) > 200 {
-		body = body[:200] + "…"
-	}
-	if body == "" {
-		return fmt.Sprintf("%s: HTTP %d", e.Op, e.Status)
-	}
-	return fmt.Sprintf("%s: HTTP %d: %s", e.Op, e.Status, body)
-}
-
-// Code 返回上游 error.code。
-func (e *HTTPError) Code() string {
-	var payload struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(e.Body, &payload) == nil {
-		return payload.Error.Code
-	}
-	return ""
-}
-
-// Retryable 报告该错误是否值得换账号 / 重试。
-//
-// 400 / 404 / 422 是请求本身的问题，重试无意义；
-// 401 / 403 / 409 / 429 / 5xx 与账号或容量相关，可以重试。
-// 例外：策略类错误码（social_login_required / machine_required /
-// lane_version_unsupported）是账号或客户端终态，换号 / 重试都没用。
-func (e *HTTPError) Retryable() bool {
-	switch e.Code() {
-	case CodeSocialLogin, CodeMachineRequired, CodeLaneUnsupported:
-		return false
-	}
-	switch e.Status {
-	case http.StatusUnauthorized, http.StatusForbidden, http.StatusConflict,
-		http.StatusTooManyRequests, http.StatusInternalServerError,
-		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	}
-	return e.Status >= 500
-}
-
-// AuthFailed 报告是否为账号鉴权失败。
-func (e *HTTPError) AuthFailed() bool {
-	if e.Status == http.StatusUnauthorized {
-		return true
-	}
-	code := e.Code()
-	return code == CodeAuthRequired || code == CodeInvalidAPIKey || code == CodeEmailUnverified
-}
-
-// SocialLoginRequired 报告账号是否被上游要求改用 Google/Apple 登录。
-//
-// 0.3.19 起上游对“邮箱 + 密码”注册的账号在 /theos 与推理端点返回 403；
-// 这是账号级策略拦截，不是鉴权失败，也不是可重试错误。
-func (e *HTTPError) SocialLoginRequired() bool { return e.Code() == CodeSocialLogin }
-
-// MachineRequired 报告是否因缺少机器指纹被拒（计量模型专属）。
-func (e *HTTPError) MachineRequired() bool { return e.Code() == CodeMachineRequired }
-
-// EmailUnverified 报告上游是否因邮箱未验证拒绝该账号。
-//
-// 与普通 403 不同：账号的登录态无效，换不换号都一样，
-// 应标记后跳过（而不是当成可重试失败反复换号）。
-func (e *HTTPError) EmailUnverified() bool { return e.Code() == CodeEmailUnverified }
-
-// LaneUnsupported 报告车道版本不再被上游接受（426）。
-func (e *HTTPError) LaneUnsupported() bool {
-	return e.Status == http.StatusUpgradeRequired || e.Code() == CodeLaneUnsupported
-}
-
-// BodyRejected 报告上游是否因“请求体不是 DeepAI Code 的形状”而拒绝。
-//
-// 上游对新车道加了请求体校验，典型响应是 400 + code=invalid_request_error，
-// message 有两种实测文案：
-//   - `This request is not one DeepAI Code sends.`（旧，2026-11-07 起）
-//   - `This request cannot be accepted.`（2026-11-13 起，0.3.36 时代）
-//
-// 两版都要能识别：漏了新文案，ChatBodyFallback（补 system + 收敛字段）就不会重试，
-// 调用方直接吃 400。
-//
-// 2026-11-15 起再加一层兜底：文案可能再次更换，而 code 一直是
-// invalid_request_error。只要 400 + 该 code 就按形状拒绝处理（仅 chat 路径会
-// 真正重试）；补形状后仍失败时，第二个错误会原样回传，不会把原因吞掉。
-func (e *HTTPError) BodyRejected() bool {
-	if e.Status != http.StatusBadRequest {
-		return false
-	}
-	body := strings.ToLower(string(e.Body))
-	if strings.Contains(body, CodeNotDeepAICodeMsg) || strings.Contains(body, CodeNotAcceptedMsg) {
-		return true
-	}
-	return e.Code() == CodeInvalidReq
-}
-
-// QuotaExhausted 报告账号当日额度是否用完（付费模型 / 余额为负）。
-func (e *HTTPError) QuotaExhausted() bool { return e.Code() == CodeTheosExhausted }
-
-// QuotaResetAt 解析额度类错误里的 refresh_at（RFC3339）。
-//
-// body 形如 {"error":{"code":"theos_exhausted","refresh_at":"2026-11-14T00:05:52+00:00"}}；
-// 解析不到时用 fallback（调用方通常传 6h，与「Try again tomorrow」的节奏一致）。
-func (e *HTTPError) QuotaResetAt(fallback time.Duration, now time.Time) time.Time {
-	var payload struct {
-		Error struct {
-			RefreshAt string `json:"refresh_at"`
-		} `json:"error"`
-	}
-	if len(e.Body) > 0 && json.Unmarshal(e.Body, &payload) == nil && payload.Error.RefreshAt != "" {
-		if ts, err := time.Parse(time.RFC3339, payload.Error.RefreshAt); err == nil && ts.After(now) {
-			return ts
-		}
-	}
-	return now.Add(fallback)
-}
-
-// CheckInRefused 报告签到是否被上游按「当天重启次数」限流。
-//
-// 它与账号不可用不同：推理照常 200，只是会落在替身模型分支
-// （见 docs/recon.md §5.1），因此不能把账号标成 error。
-func (e *HTTPError) CheckInRefused() bool { return e.Code() == CodeCheckInRefused }
-
-// IsSocialLoginRequired 报告 err 是否为 social_login_required。
-func IsSocialLoginRequired(err error) bool {
-	var he *HTTPError
-	return errors.As(err, &he) && he.SocialLoginRequired()
-}
-
-// IsCheckInRefused 报告 err 是否为签到被限流（check_in_refused）。
-func IsCheckInRefused(err error) bool {
-	var he *HTTPError
-	return errors.As(err, &he) && he.CheckInRefused()
-}
-
-// CapacityWaiting 报告是否为“会话忙”的容量拒绝。
-func (e *HTTPError) CapacityWaiting() bool {
-	return e.Status == http.StatusConflict && e.Code() == "session_busy"
-}
 
 // RetryAfter 解析 Retry-After 头（秒），默认 fallback。
 //
@@ -264,6 +109,23 @@ type Client struct {
 	UserAgent string
 	Proxy     string
 
+	// ProxyInvalid 非 nil 表示 Proxy 串解析失败（缺 scheme / 不是 http|https|socks5）。
+	//
+	// 此时 transport 不会挂专属出口，请求会退回环境变量里的全局代理；
+	// 调用方可以把这件事上报到控制台，而不是静默地「以为在用专属出口」。
+	ProxyInvalid error
+
+	// Runtime 非 nil 时，车道与签到预算改为**拉取式**：每次请求现取一次。
+	//
+	// 为什么要有它：这两项都能在控制台运行期调整，此前靠 Server 主动
+	// 「推」给每个已缓存的客户端（直连的 s.Up + 每个代理出口的客户端），
+	// 而新建客户端时还得再补一遍。三个地方漏一个，就表现为「走代理的号
+	// 与直连号行为不一致」——只在生产暴露。改成拉取后只有一处真源。
+	//
+	// nil 时回落到实例字段（SetLane / SetCheckInBudget），保留给测试与
+	// 独立使用客户端的场景。
+	Runtime RuntimeSource
+
 	// lane 是当前使用的 Theos 车道版本（atomic：探测/换道时会被并发读取）。
 	// 零值表示用编译期的 LaneVersion。
 	lane atomic.Value
@@ -282,6 +144,14 @@ type Client struct {
 	// checkInBudgetNanos 是推理前同步签到的等待预算（0 = 默认 10s）。
 	// 设置可能在推理进行时热更新，因此通过原子操作读写。
 	checkInBudgetNanos atomic.Int64
+
+	// LaneHook 在 /theos 成功解析出 lane_version 时被调用（可为 nil）。
+	//
+	// 只用于观测「上游车道 > 网关编译期车道」的漂移：那意味着客户端已经
+	// 抬了车道，而网关还在发旧值。上游在 2026-11-19 放宽了门槛（≤7 全接受），
+	// 所以 /models 探测再也发现不了这件事，只能靠 /theos 回的 lane_version。
+	// 不参与协议决策：换车道仍走 DetectLane / 升级网关。
+	LaneHook func(int)
 
 	// checkIns 缓存每个 API Key 的签到挑战与心跳时间。
 	checkIns *checkInStore
@@ -308,7 +178,7 @@ func inferClient(c *Client) *Client {
 
 // NewClientWithFingerprint 构造带代理与 User-Agent 的上游客户端。
 func NewClientWithFingerprint(proxyRaw, userAgent string) *Client {
-	origin := strings.TrimRight(EnvOr("DEEPAI_API_ORIGIN", DefaultOrigin), "/")
+	origin := strings.TrimRight(configenv.Or("DEEPAI_API_ORIGIN", DefaultOrigin), "/")
 	if u, err := url.Parse(origin); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		origin = DefaultOrigin
 	}
@@ -322,16 +192,24 @@ func NewClientWithFingerprint(proxyRaw, userAgent string) *Client {
 		ForceAttemptHTTP2:     true,
 	}
 	proxyRaw = strings.TrimSpace(proxyRaw)
-	if proxyRaw != "" {
-		if u, err := url.Parse(proxyRaw); err == nil && u.Host != "" {
-			transport.Proxy = http.ProxyURL(u)
-		}
+	// 代理串规范化：线上账号里存的是 `host:port`（没有 scheme），而 url.Parse 会把
+	// 主机名当成 scheme（点号在 scheme 字符集里合法），于是 u.Host 为空、
+	// transport.Proxy 没被设置 —— **按账号分出口静默失效**，全部退回环境变量里的
+	// 全局代理（2026-11-22 线上发现）。这里统一补 http://，解析不了就不设置，
+	// 并记在 ProxyInvalid 上供调用方判断（不静默降级）。
+	proxyURL, proxyErr := proxy.Parse(proxyRaw)
+	if proxyRaw == "" {
+		proxyErr = nil
+	}
+	if proxyErr == nil && proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
 	}
 	return &Client{
 		Origin:             origin,
-		Machine:            MachineID(),
+		Machine:            machine.ID(),
 		UserAgent:          strings.TrimSpace(userAgent),
 		Proxy:              proxyRaw,
+		ProxyInvalid:       proxyErr,
 		Instance:           newInstanceID(),
 		BrowserFingerprint: true,
 		checkIns:           newCheckInStore(),
@@ -384,14 +262,14 @@ func (c *Client) commonHeaders(req *http.Request, acct *Account) {
 		req.Header.Set(HeaderInstance, c.Instance)
 	}
 	// 机器指纹优先取账号级：上游按它发放每日免费额度，共用会互相抵消。
-	machine := c.Machine
+	machineFP := c.Machine
 	if acct != nil && acct.MachineID != "" {
-		if fp := MachineFingerprint(acct.MachineID); fp != "" {
-			machine = fp
+		if derived := machine.Fingerprint(acct.MachineID); derived != "" {
+			machineFP = derived
 		}
 	}
-	if machine != "" {
-		req.Header.Set(HeaderMachine, machine)
+	if machineFP != "" {
+		req.Header.Set(HeaderMachine, machineFP)
 	}
 
 	// 两种指纹形态二选一，不混用：
@@ -437,9 +315,12 @@ const laneGuessAhead = 6
 // laneCandidates 返回车道探测序列：编译期默认值优先，其次向上猜更新的车道，
 // 最后用旧车道兜底。
 //
-// 顺序不能反过来：`/models` 对旧车道很宽容（0.3.37 时代车道 5 / 6 都回 200），
-// 从旧值开始试会把网关永久钉在旧车道上 —— 车道 6 的目录与 5 并不相同
-// （`contextWindow` 全部收敛到 320000），钉在 5 上等于继续冒充旧客户端。
+// 顺序不能反过来：探测必须从编译期车道开始试。0.3.37 时代 `/models` 对旧车道
+// 很宽容（5 / 6 都回 200），从旧值开始试会把网关钉在旧车道上。
+//
+// 注意探测的局限（2026-11-19 上游放宽门槛后更明显）：≤7 全部回 200，所以探测
+// 只能回答“哪一档能用”，不能回答“当前车道是几”，也看不到上游已经抬到 8。
+// 后者只能靠 /theos 回的 lane_version（见 Client.LaneHook）。
 func laneCandidates() []string {
 	base, err := strconv.Atoi(LaneVersion)
 	if err != nil {
@@ -455,13 +336,34 @@ func laneCandidates() []string {
 	return out
 }
 
+// RuntimeConfig 是「运行期可调」的两项上游参数。
+type RuntimeConfig struct {
+	// Lane 是本次请求要发的 Theos 车道（空 = 用编译期 LaneVersion）。
+	Lane string
+	// CheckInBudget 是推理前同步签到的等待预算（<=0 = 用默认 10s）。
+	CheckInBudget time.Duration
+}
+
+// RuntimeSource 返回当前的运行期配置（每次请求调用一次，必须便宜）。
+type RuntimeSource func() RuntimeConfig
+
 // SetLane 设置当前车道（空串 = 用编译期默认值）。
+//
+// 注意：Client.Runtime 非 nil 时以 Runtime 为准，这里的值只在 Runtime
+// 未提供的字段上生效。Server 侧已改用拉取式（见 Runtime）。
 func (c *Client) SetLane(lane string) {
 	c.lane.Store(strings.TrimSpace(lane))
 }
 
 // laneVersion 返回本次请求要发的车道版本。
+//
+// 优先级：Runtime 拉取值 → 实例值（SetLane）→ 编译期 LaneVersion。
 func (c *Client) laneVersion() string {
+	if c.Runtime != nil {
+		if v := strings.TrimSpace(c.Runtime().Lane); v != "" {
+			return v
+		}
+	}
 	if v, ok := c.lane.Load().(string); ok && v != "" {
 		return v
 	}
@@ -533,9 +435,9 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 		return nil, &HTTPError{
 			Op:     "上游鉴权",
 			Status: http.StatusUnauthorized,
-			Body: []byte(fmt.Sprintf(
+			Body: fmt.Appendf(nil,
 				`{"error":{"type":%q,"code":%q,"message":"上游把请求重定向到登录页（API Key 无效或已失效，status=%d）"}}`,
-				CodeAuthRequired, CodeAuthRequired, resp.StatusCode)),
+				CodeAuthRequired, CodeAuthRequired, resp.StatusCode),
 		}
 	}
 	return resp, nil
@@ -660,6 +562,11 @@ func (c *Client) Theos(ctx context.Context, acct *Account) (*Allowance, error) {
 		return nil, fmt.Errorf("Theos 响应解析失败: %w", err)
 	}
 	out.CheckedAt = time.Now().Unix()
+	// 上游回的 lane_version 是**服务端当前车道**，与本次请求发的车道无关：
+	// 这是唯一能看出「客户端已经抬车道」的信号（/models 对旧车道也回 200）。
+	if out.LaneVersion > 0 && c.LaneHook != nil {
+		c.LaneHook(out.LaneVersion)
+	}
 	return &out, nil
 }
 

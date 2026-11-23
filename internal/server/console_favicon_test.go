@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"deepaicode2api/internal/observe"
 )
 
 // TestConsoleFaviconServed 守住「标签页图标」这条浏览器自动请求的固定路径。
@@ -104,12 +106,12 @@ func TestConsoleFaviconMatchesDocsAsset(t *testing.T) {
 // 「一半是图标」的噪声，还会让 /metrics 的 2xx 计数虚高。
 func TestStaticAssetsSkipAccessLog(t *testing.T) {
 	for _, p := range []string{"/favicon.ico", "/apple-touch-icon.png", "/style.css", "/js/app.js", "/assets/index-hash.js", "/ping"} {
-		if !isStaticAsset(p) {
+		if !observe.IsStaticAsset(p) {
 			t.Errorf("%s 应视为静态资源（不写访问日志）", p)
 		}
 	}
 	for _, p := range []string{"/", "/login", "/admin/api/logs", "/v1/models"} {
-		if isStaticAsset(p) {
+		if observe.IsStaticAsset(p) {
 			t.Errorf("%s 不是静态资源，不应被跳过", p)
 		}
 	}

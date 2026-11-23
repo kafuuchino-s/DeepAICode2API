@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"deepaicode2api/internal/credimport"
 	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/poolsvc"
 	"deepaicode2api/internal/server"
 	"deepaicode2api/internal/store"
 	"fmt"
@@ -46,7 +48,7 @@ func background(st *store.Store, srv *server.Server, stop <-chan struct{}) {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		start := time.Now()
-		n := srv.WarmUpstream(ctx)
+		n := srv.Pool.WarmUp(ctx)
 		if n > 0 {
 			log.Printf("[warmup] 已预热 %d 个出口的上游连接（%s）", n, time.Since(start).Round(time.Millisecond))
 		}
@@ -59,12 +61,14 @@ func background(st *store.Store, srv *server.Server, stop <-chan struct{}) {
 		case <-saveTick.C:
 			// status=error 只代表“上一次请求失败”。没再出现新失败就说明那是历史噪声，
 			// 把它改回 ok，否则徽章 / 账号列表会永远灰着（docs/changes.md §45）。
-			if n := st.RecoverStaleErrors(time.Now()); n > 0 {
+			if n := srv.Pool.RecoverStaleErrors(time.Now()); n > 0 {
 				log.Printf("[decay] %d 个账号的错误标记已超过 %s 未复现，重置为 ok", n, deepai.ErrorStaleAfter)
 			}
 			if err := st.Save(); err != nil {
 				log.Printf("定期保存状态失败: %v", err)
 			}
+			// 会话粘性绑定：无改动时这里是空操作（dirty 标记）。
+			srv.Pool.FlushSticky()
 		case <-modelTick.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			models, err := srv.RefreshModels(ctx)
@@ -84,15 +88,43 @@ func background(st *store.Store, srv *server.Server, stop <-chan struct{}) {
 // 单独一个 goroutine 而不是塞进 background：上游挂住时一批要几分钟
 // （24 个 / 4 并发 × 20s 超时），会拖住 30s 的周期保存。
 func quotaGuard(srv *server.Server, stop <-chan struct{}) {
-	tick := time.NewTicker(server.QuotaGuardInterval)
+	tick := time.NewTicker(poolsvc.QuotaGuardInterval)
 	defer tick.Stop()
 	for {
 		select {
 		case <-stop:
 			return
 		case <-tick.C:
-			if n := srv.ReprobeStale(server.QuotaGuardBatch); n > 0 {
+			if n := srv.Pool.ReprobeStale(poolsvc.QuotaGuardBatch); n > 0 {
 				log.Printf("[quota] 后台已复探 %d 个账号的额度", n)
+			}
+		}
+	}
+}
+
+// checkInWarm 是后台签到预热：把「到期的 /theos」提前在请求路径之外消化。
+//
+// 签到本身是推理前的同步调用（nonce 回传是上游判定真实客户端的依据，
+// 不能挪到推理之后），线上 2026-11-22 的 37 小时里有 940 次请求被它阻塞、
+// 最长吃满 10s 预算。预热之后热路径仍然调 EnsureCheckIn（语义不变），
+// 但绝大多数会因为「刚刚回传过」直接返回。
+//
+// 周期 30s：半衰期（seconds/2，默认 300s）内只会命中 1~2 个号；
+// 批上限 8、2 并发 —— 16 个号全部到期时最多 4 轮消化完，
+// 而每轮预算 10s（预热不使用热路径的 2.5s 短预算）。
+func checkInWarm(srv *server.Server, stop <-chan struct{}) {
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			n := srv.WarmCheckIns(ctx, 8, 2)
+			cancel()
+			if n > 0 {
+				log.Printf("[checkin] 后台预热 %d 个账号的签到", n)
 			}
 		}
 	}
@@ -100,7 +132,7 @@ func quotaGuard(srv *server.Server, stop <-chan struct{}) {
 
 // autoImport 在启动时尝试导入本机桌面端凭据。
 func autoImport(st *store.Store, dir string) {
-	results, err := deepai.ImportAllFromDesktop(dir)
+	results, err := credimport.ImportAllFromDesktop(dir)
 	if err != nil {
 		log.Printf("未自动导入桌面端凭据（可在控制台手动导入）: %v", err)
 		return
@@ -124,7 +156,7 @@ func autoImport(st *store.Store, dir string) {
 }
 
 func runImport(st *store.Store, dir string) {
-	results, err := deepai.ImportAllFromDesktop(dir)
+	results, err := credimport.ImportAllFromDesktop(dir)
 	if err != nil {
 		log.Fatalf("导入失败: %v", err)
 	}

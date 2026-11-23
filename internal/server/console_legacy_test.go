@@ -259,7 +259,7 @@ func TestConsoleBackendParity(t *testing.T) {
 		!strings.Contains(html, `fmtCompact(s.total_tokens_in)`) {
 		t.Error("概览的字符 / Token 应改用 fmtCompact")
 	}
-	for _, needle := range []string{`fmtCompact(l.prompt_len)`, `fmtCompact(l.output_len)`, `fmtCompact(l.tokens_in)`, `fmtCompact(l.tokens_out)`} {
+	for _, needle := range []string{`fmtCompact(a) + " / " + fmtCompact(b)`, `countCell(l.prompt_len, l.output_len)`, `countCell(l.tokens_in, l.tokens_out)`} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("日志应改用 fmtCompact：%s", needle)
 		}

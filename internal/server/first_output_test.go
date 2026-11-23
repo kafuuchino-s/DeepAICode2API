@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/gateway"
 	"deepaicode2api/internal/store"
 )
 
@@ -240,7 +241,7 @@ func TestFirstOutputUnavailableAndZeroJSON(t *testing.T) {
 	s, _ := newTestServer(t, nil)
 	for _, stream := range []bool{false, true} {
 		rl := s.newReqLog("", nil, "m", "chat", stream, time.Now(), 0)
-		rl.done(0, Usage{}, nil)
+		rl.done(0, gateway.Usage{}, nil)
 		entry := s.Store.Logs(1)[0]
 		if entry.TTFTMS != nil {
 			t.Fatalf("stream=%t: no output must have unknown TTFT: %+v", stream, entry)

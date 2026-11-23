@@ -7,7 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/model"
 	"deepaicode2api/internal/pool"
 )
 
@@ -37,11 +37,13 @@ type Settings struct {
 
 	// Lane 是探测到的 Theos 车道版本（空 = 用编译期默认值）。
 	//
-	// 上游抬车道时旧值一律回 426；网关启动时会借账号凭据探测一次 /models，
-	// 命中就写在这里，升级不用改代码。
+	// 网关启动时会借账号凭据探测一次 /models，命中就写在这里，升级不用改代码。
+	// 它存的是「探测命中的车道」，**不保证等于上游当前车道**：2026-11-19 上游
+	// 放宽门槛后 <=7 全部回 200，探测只能证明那一档能用；上游实际车道见
+	// Server.UpstreamLane（来自 /theos 的 lane_version）。
 	Lane string `json:"lane,omitempty"`
 
-	// LaneBuild 是写入 Lane 时的编译期车道（deepai.LaneVersion）。
+	// LaneBuild 是写入 Lane 时的编译期车道（model.LaneVersion）。
 	//
 	// 它把「本次构建探测到的结果」和「旧版本残留」区分开：正常情况下车道
 	// 只向前走，但上游也可能只保留旧车道（或探测结果比编译值旧）。只有
@@ -93,11 +95,18 @@ type LogEntry struct {
 	// GatewayCost 保留上游 gateway_cost 原值，按美元展示；nil 表示未观察到。
 	GatewayCost *float64 `json:"gateway_cost,omitempty"`
 	// nil 表示旧记录没有上报状态；false 是本次未上报，true 包括显式的零。
-	TokensInReported  *bool  `json:"tokens_in_reported,omitempty"`
-	TokensOutReported *bool  `json:"tokens_out_reported,omitempty"`
-	CachedReported    *bool  `json:"cached_tokens_known,omitempty"`
-	CostReported      *bool  `json:"cost_known,omitempty"`
-	Err               string `json:"err,omitempty"`
+	TokensInReported  *bool `json:"tokens_in_reported,omitempty"`
+	TokensOutReported *bool `json:"tokens_out_reported,omitempty"`
+	CachedReported    *bool `json:"cached_tokens_known,omitempty"`
+	CostReported      *bool `json:"cost_known,omitempty"`
+	// Messages / Sys 是本次请求回喂给上游的历史规模（不含任何正文）。
+	//
+	// 排障时第一眼要回答的问题就是「是客户端没给历史，还是网关把历史弄丢了」：
+	// Messages=1 通常说明调用方只发了本轮（典型是依赖 previous_response_id 续接
+	// 却走了无状态的 chat 合成路径），Sys=false 则说明连系统提示都没发。
+	Messages int    `json:"messages,omitempty"`
+	Sys      bool   `json:"system,omitempty"`
+	Err      string `json:"err,omitempty"`
 }
 
 // Stats 是累计统计。
@@ -136,28 +145,28 @@ type Stats struct {
 // “内容未变则跳过”永远失效。日志走 append-only 的 <base>-logs.jsonl，
 // 统计走 <base>-stats.json。
 type State struct {
-	Accounts      []*deepai.Account `json:"accounts"`
-	Keys          []*APIKey         `json:"keys"`
-	Settings      Settings          `json:"settings"`
-	Stats         Stats             `json:"-"`
-	Logs          []LogEntry        `json:"-"`
-	Models        []deepai.Model    `json:"models"`
-	DefaultModel  string            `json:"default_model"`
-	ModelsUpdated int64             `json:"models_updated"`
-	MachineID     string            `json:"machine_id"`
+	Accounts      []*model.Account `json:"accounts"`
+	Keys          []*APIKey        `json:"keys"`
+	Settings      Settings         `json:"settings"`
+	Stats         Stats            `json:"-"`
+	Logs          []LogEntry       `json:"-"`
+	Models        []model.Model    `json:"models"`
+	DefaultModel  string           `json:"default_model"`
+	ModelsUpdated int64            `json:"models_updated"`
+	MachineID     string           `json:"machine_id"`
 }
 
 // legacyState 是拆分前的状态文件格式（含 logs / stats），仅用于读取迁移。
 type legacyState struct {
-	Accounts      []*deepai.Account `json:"accounts"`
-	Keys          []*APIKey         `json:"keys"`
-	Settings      Settings          `json:"settings"`
-	Stats         Stats             `json:"stats"`
-	Logs          []LogEntry        `json:"logs"`
-	Models        []deepai.Model    `json:"models"`
-	DefaultModel  string            `json:"default_model"`
-	ModelsUpdated int64             `json:"models_updated"`
-	MachineID     string            `json:"machine_id"`
+	Accounts      []*model.Account `json:"accounts"`
+	Keys          []*APIKey        `json:"keys"`
+	Settings      Settings         `json:"settings"`
+	Stats         Stats            `json:"stats"`
+	Logs          []LogEntry       `json:"logs"`
+	Models        []model.Model    `json:"models"`
+	DefaultModel  string           `json:"default_model"`
+	ModelsUpdated int64            `json:"models_updated"`
+	MachineID     string           `json:"machine_id"`
 }
 
 // Store 是带锁的状态容器。
@@ -167,10 +176,13 @@ type Store struct {
 	st    *State
 	sched *pool.Scheduler
 
-	// statsPath / logsPath 是由主路径派生的旁路文件。
-	statsPath string
-	logsPath  string
-	logs      *logStore
+	// statsPath / logsPath / stickyPath 是由主路径派生的旁路文件。
+	statsPath  string
+	logsPath   string
+	stickyPath string
+	logs       *logStore
+	// stickyLast 是上次写入绑定表的明文，用于跳过无变化的重复写盘。
+	stickyLast []byte
 
 	// masterKey 非空时状态文件整体加密（AES-256-GCM）。
 	masterKey []byte
@@ -207,9 +219,9 @@ type Store struct {
 func DefaultSettings() Settings {
 	return Settings{
 		ModelAliases:   map[string]string{},
-		RequestTimeout: 600,
-		MaxRetries:     3,
-		LogKeep:        500,
+		RequestTimeout: DefaultRequestTimeout,
+		MaxRetries:     DefaultMaxRetries,
+		LogKeep:        DefaultLogKeep,
 		// 默认仅放行本机来源；如需局域网访问，在控制台显式配置。
 		CORSOrigin:    "",
 		FallbackModel: "",

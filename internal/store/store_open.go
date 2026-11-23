@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/model"
 	"deepaicode2api/internal/pool"
 )
 
@@ -38,15 +38,16 @@ func deriveSidePaths(path string) (statsPath, logsPath string) {
 
 // OpenWithKey 用指定主密钥载入状态文件（key 为 nil 表示不加密）。
 //
-// 主文件之外还有两个旁路文件（由主路径派生）：
+// 主文件之外还有三个旁路文件（由主路径派生）：
 //   - <base>-stats.json   累计统计（几百字节，每 30s 写一次）
 //   - <base>-logs.jsonl   请求日志（append-only，按大小轮转）
+//   - <base>-sticky.json  会话粘性绑定（affinity → 账号，随重启保留）
 //
 // 旧版本把 logs / stats 内嵌在主文件里，载入时自动迁出并重写主文件。
 func OpenWithKey(path string, key []byte) (*Store, error) {
 	statsPath, logsPath := deriveSidePaths(path)
 	s := &Store{
-		path: path, statsPath: statsPath, logsPath: logsPath,
+		path: path, statsPath: statsPath, logsPath: logsPath, stickyPath: deriveStickyPath(path),
 		st: &State{Settings: DefaultSettings()}, masterKey: key, sched: pool.New(),
 	}
 
@@ -249,7 +250,7 @@ const saveTimestampGranularity = 300
 // 复用活指针会让 ToggleKey / DeleteKey 与 marshal 撞车（-race 可见）。
 func (s *Store) snapshotLocked() State {
 	snap := *s.st
-	snap.Accounts = make([]*deepai.Account, len(s.st.Accounts))
+	snap.Accounts = make([]*model.Account, len(s.st.Accounts))
 	for i, a := range s.st.Accounts {
 		c := a.Clone()
 		c.LastUsed = quantizeTimestamp(c.LastUsed)
@@ -273,11 +274,11 @@ func (s *Store) snapshotLocked() State {
 }
 
 // cloneModels 复制模型目录（含 Input 切片与 TheosPerSecond map）。
-func cloneModels(models []deepai.Model) []deepai.Model {
+func cloneModels(models []model.Model) []model.Model {
 	if models == nil {
 		return nil
 	}
-	out := make([]deepai.Model, len(models))
+	out := make([]model.Model, len(models))
 	for i, m := range models {
 		if m.Input != nil {
 			m.Input = append([]string(nil), m.Input...)

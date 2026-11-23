@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/gateway"
 	"deepaicode2api/internal/httpx"
 )
 
@@ -45,7 +46,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 而 OpenAI 规范里缺省等价于 false，两者不一致会导致非流式请求拿到
 	// `data: {...}` 无法解析。
 	payload["stream"] = stream
-	affinity := affinityFor(r, payload)
+	affinity := sessionAffinity(r, payload)
 	group := s.requestGroup(r)
 
 	body, err := json.Marshal(payload)
@@ -64,9 +65,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 	resp, acct, err := s.openModel(ctx, deepai.PathChat, body, affinity, group, key, stream, !modelRequiresPaidQuota(model))
-	rl := s.newReqLog(key, acct, model.ID, "chat", stream, start, promptLen)
+	rl := s.newReqLog(key, acct, model.ID, "chat", stream, start, promptLen).withHistory(payload)
 	if err != nil {
-		rl.done(0, Usage{}, err)
+		rl.done(0, gateway.Usage{}, err)
 		writeUpstreamErr(w, err)
 		return
 	}
@@ -79,7 +80,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	rawResp, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		rl.done(0, Usage{}, err)
+		rl.done(0, gateway.Usage{}, err)
 		httpx.WriteErr(w, http.StatusBadGateway, "读取上游响应失败: "+err.Error(), "upstream_error")
 		return
 	}
@@ -89,7 +90,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 把响应类型与开头片段写进日志，否则只剩“不是合法 JSON”无从下手。
 		log.Printf("上游响应解析失败：account=%s status=%d ct=%q len=%d head=%q",
 			acctLabel(acct), resp.StatusCode, resp.Header.Get("Content-Type"), len(rawResp), headOf(rawResp, 160))
-		rl.done(0, Usage{}, err)
+		rl.done(0, gateway.Usage{}, err)
 		httpx.WriteErr(w, http.StatusBadGateway, "上游响应不是合法 JSON", "upstream_error")
 		return
 	}
@@ -158,7 +159,7 @@ func (s *Server) streamChat(w http.ResponseWriter, body io.Reader, rl reqLog) {
 	sw := newSSEWriter(w)
 
 	var (
-		usage    Usage
+		usage    gateway.Usage
 		outLen   int
 		doneSent bool
 	)

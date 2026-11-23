@@ -21,8 +21,11 @@ import (
 	"net/http"
 	"strings"
 
+	"deepaicode2api/internal/credimport"
 	"deepaicode2api/internal/deepai"
 	"deepaicode2api/internal/httpx"
+	"deepaicode2api/internal/machine"
+	"deepaicode2api/internal/poolsvc"
 	"deepaicode2api/internal/proxy"
 )
 
@@ -133,7 +136,7 @@ func (s *Server) adminImport(w http.ResponseWriter, raw []byte) {
 	if !ok {
 		return
 	}
-	results, err := deepai.ImportAllFromDesktop(body.Dir)
+	results, err := credimport.ImportAllFromDesktop(body.Dir)
 	if err != nil {
 		httpx.WriteErr(w, http.StatusBadRequest, "导入失败: "+err.Error(), "invalid_request_error")
 		return
@@ -158,7 +161,7 @@ func (s *Server) adminManual(w http.ResponseWriter, raw []byte) {
 	if !ok {
 		return
 	}
-	acct, err := deepai.AccountFromAPIKey(body.APIKey, body.Name, "manual", false)
+	acct, err := credimport.AccountFromAPIKey(body.APIKey, body.Name, "manual", false)
 	if err != nil {
 		httpx.WriteErr(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
@@ -170,7 +173,7 @@ func (s *Server) adminManual(w http.ResponseWriter, raw []byte) {
 	if !s.persistOrFail(w) {
 		return
 	}
-	s.probeAndSaveAsync(acct)
+	s.Pool.ProbeAndSaveAsync(acct)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "new": isNew, "id": acct.ID})
 }
 
@@ -192,9 +195,9 @@ func (s *Server) adminEnroll(w http.ResponseWriter, raw []byte) {
 	}
 	// 每个账号必须有独立机器指纹；否则上游的每日免费额度会与其他账号互斥。
 	if reg.MachineID == "" {
-		reg.MachineID = deepai.NewMachineUUID()
+		reg.MachineID = machine.NewUUID()
 	}
-	acct, err := deepai.AccountFromRegistration(reg)
+	acct, err := credimport.AccountFromRegistration(reg)
 	if err != nil {
 		httpx.WriteErr(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
@@ -204,9 +207,9 @@ func (s *Server) adminEnroll(w http.ResponseWriter, raw []byte) {
 	var al *deepai.Allowance
 	balance, granted := strings.TrimSpace(body.TheosBalance), strings.TrimSpace(body.TheosGranted)
 	if body.SkipProbe && balance != "" {
-		al = allowanceFromEnroll(balance, granted, "")
+		al = poolsvc.AllowanceFromEnroll(balance, granted, "")
 	} else {
-		probed, err := s.probeAccountQuota(acct)
+		probed, err := s.Pool.ProbeAccountQuota(acct)
 		if err != nil {
 			if deepai.IsSocialLoginRequired(err) {
 				httpx.WriteErr(w, http.StatusBadRequest, "上游已限制为 Google/Apple 登录（social_login_required），该 Key 无法推理", "social_login_required")
@@ -224,7 +227,7 @@ func (s *Server) adminEnroll(w http.ResponseWriter, raw []byte) {
 		}
 	}
 
-	id, isNew, err := s.enrollRegistration(reg, al)
+	id, isNew, err := s.Pool.EnrollRegistration(reg, al)
 	if err != nil {
 		httpx.WriteErr(w, http.StatusInternalServerError, "入池失败: "+err.Error(), "server_error")
 		return
@@ -291,7 +294,7 @@ func (s *Server) adminAssignMachine(w http.ResponseWriter, raw []byte) {
 		if strings.TrimSpace(a.MachineID) != "" {
 			return false
 		}
-		a.MachineID = deepai.NewMachineUUID()
+		a.MachineID = machine.NewUUID()
 		targets = append(targets, a.Clone())
 		return true
 	})
@@ -300,7 +303,7 @@ func (s *Server) adminAssignMachine(w http.ResponseWriter, raw []byte) {
 	}
 	// 重新探测配额，让调度能立即看到新指纹下的额度。
 	// 走登记过的批量入口：进程关停时要等这次落盘跑完。
-	s.probeBatchAsync(targets)
+	s.Pool.ProbeBatchAsync(targets)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "assigned": assigned})
 }
 
@@ -344,7 +347,7 @@ func (s *Server) adminAssignProxy(w http.ResponseWriter, raw []byte) {
 		return
 	}
 
-	pool, err := loadProxyPool()
+	pool, err := s.assignProxyPool()
 	if err != nil {
 		httpx.WriteErr(w, http.StatusBadRequest, "代理池配置错误: "+err.Error(), "invalid_request_error")
 		return
@@ -352,6 +355,34 @@ func (s *Server) adminAssignProxy(w http.ResponseWriter, raw []byte) {
 	if pool == nil || pool.Len() == 0 {
 		httpx.WriteErr(w, http.StatusBadRequest, "未配置代理池（PROXY_POOL / DEEPAI_REGISTER_PROXY_POOL / PROXY_POOL_FILE）", "invalid_request_error")
 		return
+	}
+
+	// 选出口：优先用「当前账号数最少」的条目，同样多时按游标轮转。
+	//
+	// 历史行为是每次调用都新建一个池，Next() 永远从第 0 条开始，于是
+	// **每次「分配代理」都落到同一个出口**（2026-11-22 线上：新增 3 个账号全挤在
+	// 同一条住宅代理上，等于共享同一个出口 IP 的每日额度）。游标必须跨调用保留，
+	// 而且要避开已被占用的条目。
+	usage := map[string]int{}
+	s.Store.UpdateAccounts(func(a *deepai.Account) bool {
+		if k := proxyEgressKey(a.Proxy); k != "" {
+			usage[k]++
+		}
+		return false
+	})
+	leastUsed := func() string {
+		best := ""
+		bestN := 1 << 30
+		for i := 0; i < pool.Len(); i++ {
+			p := pool.Next()
+			if p == "" {
+				continue
+			}
+			if n := usage[proxyEgressKey(p)]; n < bestN {
+				best, bestN = p, n
+			}
+		}
+		return best
 	}
 
 	dist := map[string]int{}
@@ -362,20 +393,48 @@ func (s *Server) adminAssignProxy(w http.ResponseWriter, raw []byte) {
 		if !body.Reassign && strings.TrimSpace(a.Proxy) != "" {
 			return false
 		}
-		p := pool.Next()
+		p := leastUsed()
 		if p == "" {
 			return false
 		}
+		old := proxyEgressKey(a.Proxy)
 		a.Proxy = p
+		if old != "" {
+			usage[old]--
+		}
+		usage[proxyEgressKey(p)]++
 		dist[proxy.ProxyLabel(p)]++
 		return true
 	})
 	if !s.persistOrFail(w) {
 		return
 	}
+	// distinct 让运维一眼看出「池子够不够」：17 个号 / 11 个出口必然有共享。
+	distinct := 0
+	for _, n := range usage {
+		if n > 0 {
+			distinct++
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "assigned": assigned, "pool_size": pool.Len(), "proxies": dist,
+		"ok": true, "assigned": assigned, "pool_size": pool.Len(),
+		"in_use": distinct, "proxies": dist,
 	})
+}
+
+// proxyEgressKey 把代理串归一成「出口标识」（host:port），用于统计账号数。
+//
+// 存储层的代理串可能带或不带 scheme（`https://host:port` / `host:port`），
+// 直接字符串比较会把同一个出口当成两个。
+func proxyEgressKey(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if u, err := proxy.Parse(raw); err == nil && u.Host != "" {
+		return strings.ToLower(u.Host)
+	}
+	return strings.ToLower(raw)
 }
 
 // adminMarkVerified 由后台验证链路回填 email_verified（入池时可能还是 false）。
@@ -384,7 +443,7 @@ func (s *Server) adminMarkVerified(w http.ResponseWriter, raw []byte) {
 	if !ok {
 		return
 	}
-	if err := s.markAccountVerified(body.ID, body.Email); err != nil {
+	if err := s.Pool.MarkVerified(body.ID, body.Email); err != nil {
 		httpx.WriteErr(w, http.StatusNotFound, err.Error(), "invalid_request_error")
 		return
 	}

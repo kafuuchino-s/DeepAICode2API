@@ -229,6 +229,7 @@ func TestRefreshModelsRetriesAfterLaneUpgrade(t *testing.T) {
 		_, _ = io.WriteString(w, modelsForWarmup)
 	})
 	s, _ := newTestServer(t, u)
+	s.applyLane("6")
 
 	models, err := s.RefreshModels(context.Background())
 	if err != nil {
@@ -243,8 +244,8 @@ func TestRefreshModelsRetriesAfterLaneUpgrade(t *testing.T) {
 	if got := u.last(t).Header.Get(deepai.HeaderLane); got != "7" {
 		t.Fatalf("最终目录请求车道 = %q，期望 7", got)
 	}
-	if got := countPath(u, deepai.ModelBasePath+deepai.PathModels); got != 4 {
-		t.Fatalf("车道失败后的请求数 = %d，期望初次目录 + 两次探测 + 重试", got)
+	if got := countPath(u, deepai.ModelBasePath+deepai.PathModels); got != 3 {
+		t.Fatalf("车道失败后的请求数 = %d，期望初次目录 + 编译期车道探测 + 重试", got)
 	}
 }
 

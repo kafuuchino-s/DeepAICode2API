@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/gateway"
 	"deepaicode2api/internal/httpx"
 )
 
@@ -22,7 +23,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 	start := time.Now()
 
-	req, ok := httpx.DecodeJSONRequest[anthropicRequest](w, r, func(code int, msg string) {
+	req, ok := httpx.DecodeJSONRequest[gateway.AnthropicRequest](w, r, func(code int, msg string) {
 		writeAnthropicErr(w, code, "invalid_request_error", msg)
 	})
 	if !ok {
@@ -38,16 +39,18 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicErr(w, http.StatusNotFound, "invalid_request_error", s.unknownModelMessage(req.Model))
 		return
 	}
-	payload, err := anthropicToChatPayload(&req, model.ID)
+	payload, err := gateway.AnthropicToChatPayload(&req, model.ID)
 	if err != nil {
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	affinity := affinityFor(r, nil)
+	// 会话级 affinity：客户端给了就用，没给就用稳定前缀派生（见 request.go）。
+	// 既保上游前缀缓存分区，也让选号把同一会话钉在同一个账号上。
+	affinity := sessionAffinity(r, payload)
 	key := extractKey(r)
 	promptLen := estimatePromptLen(payload)
 
-	rl := s.newReqLog(key, nil, model.ID, "messages", req.Stream, start, promptLen)
+	rl := s.newReqLog(key, nil, model.ID, "messages", req.Stream, start, promptLen).withHistory(payload)
 	rl.allowExhausted = !modelRequiresPaidQuota(model)
 	if req.Stream {
 		s.streamAnthropic(w, r, payload, affinity, rl)
@@ -64,13 +67,13 @@ func (s *Server) blockingAnthropic(w http.ResponseWriter, r *http.Request, paylo
 	out, acct, err := s.callJSON(ctx, deepai.PathChat, payload, affinity, s.requestGroup(r), rl.apiKey(), rl.allowExhausted)
 	rl.acct = acct
 	if err != nil {
-		rl.done(0, Usage{}, err)
+		rl.done(0, gateway.Usage{}, err)
 		writeAnthropicUpstreamErr(w, err)
 		return
 	}
 	usage := rl.observeUsage(out["usage"])
-	msg := chatToAnthropicMessage(out, rl.model)
-	outLen := anthropicTextLen(msg)
+	msg := gateway.ChatToAnthropicMessage(out, rl.model)
+	outLen := gateway.AnthropicTextLen(msg)
 
 	rl.done(outLen, usage, nil)
 	httpx.WriteJSON(w, http.StatusOK, msg)
@@ -83,14 +86,14 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		rl.doneStatus(http.StatusBadRequest, 0, Usage{}, err)
+		rl.doneStatus(http.StatusBadRequest, 0, gateway.Usage{}, err)
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "请求序列化失败")
 		return
 	}
 	resp, acct, err := s.openModel(ctx, deepai.PathChat, body, affinity, s.requestGroup(r), rl.apiKey(), true, rl.allowExhausted)
 	rl.acct = acct
 	if err != nil {
-		rl.done(0, Usage{}, err)
+		rl.done(0, gateway.Usage{}, err)
 		writeAnthropicUpstreamErr(w, err)
 		return
 	}
@@ -114,9 +117,9 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 		},
 	})
 
-	block := newAnthropicBlockWriter(send)
+	block := gateway.NewAnthropicBlockWriter(send)
 	var (
-		usage      Usage
+		usage      gateway.Usage
 		outLen     int
 		stopReason = "end_turn"
 		streamErr  error
@@ -131,7 +134,7 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 			rl.markFirstOutput()
 		}
 		if finish != "" {
-			stopReason = anthropicStopReason(finish)
+			stopReason = gateway.AnthropicStopReason(finish)
 		}
 		if d.Reasoning != "" {
 			block.Thinking(d.Reasoning)
@@ -155,24 +158,28 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 			"type":  "error",
 			"error": map[string]any{"type": "api_error", "message": streamErr.Error()},
 		})
-	} else {
-		block.Finish()
+		// Anthropic 的事件模型里 error 是终止事件：后面不能再跟 message_delta /
+		// message_stop。旧实现在 error 之后照样补一条 message_delta
+		// （stop_reason=end_turn），把“出错的流”宣告成正常结束，客户端可能把
+		// 半截工具调用当成功。
+		rl.done(outLen, usage, streamErr)
+		return
 	}
+	block.Finish()
 	outputTokens := usage.CompletionTokens
 	if outputTokens == 0 {
 		outputTokens = estTokens(outLen)
 	}
+	usageDelta := gateway.AnthropicUsage(usage)
+	usageDelta["output_tokens"] = outputTokens
 	send("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": map[string]any{
-			"input_tokens":  usage.PromptTokens,
-			"output_tokens": outputTokens,
-		},
+		"usage": usageDelta,
 	})
 	send("message_stop", map[string]any{"type": "message_stop"})
 
-	rl.done(outLen, usage, streamErr)
+	rl.done(outLen, usage, nil)
 }
 
 // handleAnthropicCountTokens 返回粗略的输入 token 估算。
@@ -184,13 +191,13 @@ func (s *Server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		writeAnthropicErr(w, http.StatusMethodNotAllowed, "invalid_request_error", "仅支持 POST")
 		return
 	}
-	req, ok := httpx.DecodeJSONRequest[anthropicRequest](w, r, func(code int, msg string) {
+	req, ok := httpx.DecodeJSONRequest[gateway.AnthropicRequest](w, r, func(code int, msg string) {
 		writeAnthropicErr(w, code, "invalid_request_error", msg)
 	})
 	if !ok {
 		return
 	}
-	payload, err := anthropicToChatPayload(&req, s.resolveModel(req.Model).ID)
+	payload, err := gateway.AnthropicToChatPayload(&req, s.resolveModel(req.Model).ID)
 	if err != nil {
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -220,10 +227,10 @@ func writeAnthropicErr(w http.ResponseWriter, code int, typ, msg string) {
 }
 
 // requestTimeout 返回设置里的请求超时。
+// requestTimeout 返回单请求整体预算。
+//
+// 默认值与范围校验在 store.Settings.Normalize / Validate 里统一定义，
+// 这里不再重复「<=0 就取 600」——那种兜底曾经散在三处。
 func (s *Server) requestTimeout() time.Duration {
-	sec := s.Store.Settings().RequestTimeout
-	if sec <= 0 {
-		sec = 600
-	}
-	return time.Duration(sec) * time.Second
+	return s.Store.Settings().RuntimeView().RequestTimeout
 }

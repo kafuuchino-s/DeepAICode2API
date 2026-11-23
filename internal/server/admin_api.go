@@ -8,8 +8,11 @@ import (
 	"strings"
 	"time"
 
+	"deepaicode2api/internal/accountview"
 	"deepaicode2api/internal/deepai"
 	"deepaicode2api/internal/httpx"
+	"deepaicode2api/internal/observe"
+	"deepaicode2api/internal/poolsvc"
 	"deepaicode2api/internal/registry"
 	"deepaicode2api/internal/store"
 )
@@ -46,7 +49,7 @@ func accountView(a *deepai.Account) map[string]any {
 		"theos":       a.Theos,
 		// quota_age 是额度快照的年龄（秒）；quota_due 表示按需复探会去刷新它。
 		"quota_age": age,
-		"quota_due": quotaNeedsRefresh(a, time.Now(), quotaStaleAfter),
+		"quota_due": poolsvc.NeedsRefresh(a, time.Now(), quotaStaleAfter),
 	}
 }
 
@@ -61,17 +64,17 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	}
 	settings := s.Store.Settings()
 	total, ready := s.Store.AccountCounts()
-	snap := s.metrics.snapshot()
+	snap := s.metrics.Snapshot()
 	byEndpoint := make(map[string]map[string]float64, len(snap.ByEndpoint))
 	for ep, hist := range snap.ByEndpoint {
-		byEndpoint[ep] = latencySummary(hist)
+		byEndpoint[ep] = observe.LatencySummary(hist)
 	}
 	checkinStats := map[string]any{
 		"attempts": snap.CheckInStats["attempts"],
 		"blocked":  snap.CheckInStats["blocked"],
 		"timeouts": snap.CheckInStats["timeouts"],
-		"p50_ms":   quantileMs(snap.CheckIn, 0.50),
-		"p95_ms":   quantileMs(snap.CheckIn, 0.95),
+		"p50_ms":   observe.QuantileMs(snap.CheckIn, 0.50),
+		"p95_ms":   observe.QuantileMs(snap.CheckIn, 0.95),
 	}
 	writeJSONCached(w, r, http.StatusOK, map[string]any{
 		"accounts":       total,
@@ -84,12 +87,21 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 		"settings":       sanitizedSettings(settings),
 		"stats":          s.Store.Stats(),
 		"upstream":       s.Up.Origin,
+		// 车道：网关发出的 / 编译期 / 上游回报 / 漂移。漂移 > 0 说明客户端
+		// 已经抬了车道，控制台据此提示升级（不自动换道）。
+		"lane":          s.CurrentLane(),
+		"lane_compiled": deepai.LaneVersion,
+		"lane_upstream": s.UpstreamLane(),
+		"lane_drift":    s.LaneDrift(),
 		// 运行健康：延迟分位、签到、兜底与上游错误码（metrics.go）。
-		"latency":             latencySummary(snap.Latency),
+		"latency":             observe.LatencySummary(snap.Latency),
 		"latency_by_endpoint": byEndpoint,
 		"checkin":             checkinStats,
 		"fallback_total":      snap.Fallback,
 		"upstream_errors":     snap.UpstreamErrs,
+		// 出口冷却数：连续传输失败的代理数（proxy.Health）。
+		// 不为 0 时说明有账号的出口正在避让，排障先看代理侧。
+		"proxy_cooling": s.ProxyCoolingCount(),
 	})
 }
 
@@ -109,7 +121,8 @@ func (s *Server) handleAdminAccountsPage(w http.ResponseWriter, r *http.Request)
 	sortKey := strings.TrimSpace(q.Get("sort"))
 	desc := strings.EqualFold(q.Get("order"), "desc")
 
-	page := s.Store.AccountPage(store.AccountQuery{
+	// 过滤 / 排序 / 分页是展示层规则（见 internal/accountview）：store 只出快照。
+	page := accountview.Accounts(s.Store.Accounts(), accountview.Query{
 		Offset: offset, Limit: limit,
 		Group: q.Get("group"), Status: q.Get("status"), Query: q.Get("q"),
 		Sort: sortKey, Desc: desc,

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,7 +9,11 @@ import (
 	"time"
 
 	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/gateway"
 	"deepaicode2api/internal/httpx"
+	"deepaicode2api/internal/jsonx"
+	"deepaicode2api/internal/logx"
+	"deepaicode2api/internal/respstate"
 )
 
 // handleResponses 是 /v1/responses 的入口。
@@ -38,31 +43,72 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	payload["model"] = model.ID
 	stream, _ := payload["stream"].(bool)
-	affinity := affinityFor(r, payload)
+	affinity := sessionAffinity(r, payload)
 	key := extractKey(r)
-	promptLen := estimatePromptLen(payload)
+	scope := sha256.Sum256([]byte(key))
+	prevID := jsonx.StrOf(payload["previous_response_id"])
 
-	rls := s.newReqLog(key, nil, model.ID, "responses", stream, start, promptLen)
+	rls := s.newReqLog(key, nil, model.ID, "responses", stream, start, estimatePromptLen(payload))
 	rls.allowExhausted = !modelRequiresPaidQuota(model)
+	// 先記下「本輪新增的 input」與續接父 id：重放會把 payload["input"] 換成完整
+	// 歷史，那之後就取不到增量了（暫存只存增量 + 檢查點，完整歷史由鏈還原）。
+	turn := &respstate.Turn{
+		Input:        respstate.InputItems(payload),
+		Instructions: jsonx.StrOf(payload["instructions"]),
+		Scope:        string(scope[:]),
+		Parent:       prevID,
+	}
+	if p := gateway.StatefulParam(payload); p != "" {
+		// previous_response_id：合成路徑現在透過伺服端歷史暫存重放上下文，
+		// 不再直接回 400（那是「失憶」的根因）。重放失敗才退回明確 400。
+		// conversation / item_reference 需要上游保存的服務端會話/條目，
+		// 網關無從重建，保留明確 400 並在文件寫清楚。
+		if !model.IsResponses() && p == "previous_response_id" {
+			outcome, msg := s.history.Replay(payload, turn.Scope, prevID, model.ID, model.ContextWindow)
+			switch outcome {
+			case respstate.NotFound:
+				s.metrics.AddStateful(p, true)
+				httpx.WriteErr(w, http.StatusBadRequest,
+					(&gateway.StatefulParamError{Param: p}).Error(), "unsupported_parameter")
+				return
+			case respstate.TooLong:
+				s.metrics.AddStateful(p, true)
+				httpx.WriteErr(w, http.StatusBadRequest, msg, "invalid_request_error")
+				return
+			}
+			s.metrics.AddStateful(p, false) // 已重放，視為成功續接
+			logx.Info("Responses 歷史重放成功", "model", model.ID, "prev", prevID)
+		} else if !model.IsResponses() {
+			s.metrics.AddStateful(p, true)
+			httpx.WriteErr(w, http.StatusBadRequest,
+				(&gateway.StatefulParamError{Param: p}).Error(), "unsupported_parameter")
+			return
+		} else {
+			s.metrics.AddStateful(p, false)
+			logx.Warn("上游 /responses 透傳帶狀態字段：續接能力取決於上游",
+				"param", p, "model", model.ID)
+		}
+	}
 	if model.IsResponses() {
-		s.passthroughResponses(w, r, payload, affinity, rls)
+		s.passthroughResponses(w, r, payload, affinity, rls.withHistory(payload), turn)
 		return
 	}
 
-	chatPayload, err := responsesToChatPayload(payload, model.ID)
+	chatPayload, err := gateway.ResponsesToChatPayload(payload, model.ID)
 	if err != nil {
 		httpx.WriteErr(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
+	rls = rls.withHistory(chatPayload)
 	if stream {
-		s.streamResponsesAsChat(w, r, chatPayload, affinity, rls)
+		s.streamResponsesAsChat(w, r, chatPayload, affinity, rls, turn)
 		return
 	}
-	s.blockingResponsesAsChat(w, r, chatPayload, affinity, rls)
+	s.blockingResponsesAsChat(w, r, chatPayload, affinity, rls, turn)
 }
 
 // passthroughResponses 透传上游 /responses。
-func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, payload map[string]any, affinity string, rl reqLog) {
+func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, payload map[string]any, affinity string, rl reqLog, turn *respstate.Turn) {
 	ctx, cancel := httpx.ContextWithTimeout(r, s.requestTimeout())
 	defer cancel()
 
@@ -70,14 +116,14 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 	payload["stream"] = rl.stream
 	body, err := json.Marshal(payload)
 	if err != nil {
-		rl.doneStatus(http.StatusBadRequest, 0, Usage{}, err)
+		rl.doneStatus(http.StatusBadRequest, 0, gateway.Usage{}, err)
 		httpx.WriteErr(w, http.StatusBadRequest, "请求序列化失败", "invalid_request_error")
 		return
 	}
 	resp, acct, err := s.openModel(ctx, deepai.PathResponses, body, affinity, s.requestGroup(r), rl.apiKey(), rl.stream, rl.allowExhausted)
 	rl.acct = acct
 	if err != nil {
-		rl.done(0, Usage{}, err)
+		rl.done(0, gateway.Usage{}, err)
 		writeUpstreamErr(w, err)
 		return
 	}
@@ -86,7 +132,7 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 	if !rl.stream {
 		rawResp, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		if err != nil {
-			rl.done(0, Usage{}, err)
+			rl.done(0, gateway.Usage{}, err)
 			httpx.WriteErr(w, http.StatusBadGateway, "读取上游响应失败: "+err.Error(), "upstream_error")
 			return
 		}
@@ -96,13 +142,16 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 			// 保持原样透传 + 200（客户端拿到的与上游一致），但**必须留日志**：
 			// 旧实现在这里直接 return，请求会从控制台日志与统计里彻底消失。
 			httpx.WriteRawJSON(w, http.StatusOK, rawResp)
-			rl.doneStatus(http.StatusOK, 0, Usage{},
+			rl.doneStatus(http.StatusOK, 0, gateway.Usage{},
 				fmt.Errorf("上游响应不是合法 JSON（已原样透传）: %w", err))
 			return
 		}
 		rewriteResponsesModel(out, rl.model)
 		usage := rl.observeUsage(out["usage"])
 		outLen := responsesTextLen(out)
+		if jsonx.StrOf(out["status"]) == "completed" {
+			s.rememberResponse(turn, out)
+		}
 		encoded, _ := json.Marshal(out)
 		rl.done(outLen, usage, nil)
 		httpx.WriteRawJSON(w, http.StatusOK, encoded)
@@ -111,8 +160,9 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 
 	sw := newSSEWriter(w)
 	var (
-		usage  Usage
-		outLen int
+		usage     gateway.Usage
+		outLen    int
+		finalResp map[string]any
 	)
 	streamErr := forEachSSEFrame(resp.Body, func(f sseFrame) bool {
 		if f.Event != "" {
@@ -137,6 +187,10 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 			rl.markFirstOutput()
 		}
 		if respObj, ok := obj["response"].(map[string]any); ok {
+			// 記住最終 response 物件（含 id / output）：串流重放的依據。
+			if jsonx.StrOf(obj["type"]) == "response.completed" {
+				finalResp = respObj
+			}
 			if u := rl.observeUsage(respObj["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
 				usage = u
 			}
@@ -159,44 +213,48 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 			sw.event("error", payload)
 		}
 	}
+	if streamErr == nil {
+		s.rememberResponse(turn, finalResp)
+	}
 	rl.done(outLen, usage, streamErr)
 }
 
 // blockingResponsesAsChat 用 Chat Completions 合成 Responses 响应。
-func (s *Server) blockingResponsesAsChat(w http.ResponseWriter, r *http.Request, chatPayload map[string]any, affinity string, rl reqLog) {
+func (s *Server) blockingResponsesAsChat(w http.ResponseWriter, r *http.Request, chatPayload map[string]any, affinity string, rl reqLog, turn *respstate.Turn) {
 	ctx, cancel := httpx.ContextWithTimeout(r, s.requestTimeout())
 	defer cancel()
 
 	out, acct, err := s.callJSON(ctx, deepai.PathChat, chatPayload, affinity, s.requestGroup(r), rl.apiKey(), rl.allowExhausted)
 	rl.acct = acct
 	if err != nil {
-		rl.done(0, Usage{}, err)
+		rl.done(0, gateway.Usage{}, err)
 		writeUpstreamErr(w, err)
 		return
 	}
-	respObj := chatToResponsesObject(out, rl.model)
+	respObj := gateway.ChatToResponsesObject(out, rl.model)
 	usage := rl.observeUsage(out["usage"])
 	outLen := responsesTextLen(respObj)
 
+	s.rememberResponse(turn, respObj)
 	rl.done(outLen, usage, nil)
 	httpx.WriteJSON(w, http.StatusOK, respObj)
 }
 
 // streamResponsesAsChat 用 Chat Completions 流合成 Responses 事件流。
-func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, chatPayload map[string]any, affinity string, rl reqLog) {
+func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, chatPayload map[string]any, affinity string, rl reqLog, turn *respstate.Turn) {
 	ctx, cancel := httpx.ContextWithTimeout(r, s.requestTimeout())
 	defer cancel()
 
 	body, err := json.Marshal(chatPayload)
 	if err != nil {
-		rl.doneStatus(http.StatusBadRequest, 0, Usage{}, err)
+		rl.doneStatus(http.StatusBadRequest, 0, gateway.Usage{}, err)
 		httpx.WriteErr(w, http.StatusBadRequest, "请求序列化失败", "invalid_request_error")
 		return
 	}
 	resp, acct, err := s.openModel(ctx, deepai.PathChat, body, affinity, s.requestGroup(r), rl.apiKey(), true, rl.allowExhausted)
 	rl.acct = acct
 	if err != nil {
-		rl.done(0, Usage{}, err)
+		rl.done(0, gateway.Usage{}, err)
 		writeUpstreamErr(w, err)
 		return
 	}
@@ -207,7 +265,7 @@ func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, c
 	gen.created()
 
 	var (
-		usage  Usage
+		usage  gateway.Usage
 		outLen int
 	)
 	streamErr := forEachChatChunk(resp.Body, func(chunk map[string]any) bool {
@@ -237,12 +295,28 @@ func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, c
 
 	if streamErr != nil {
 		gen.fail(streamErr)
+	} else {
+		gen.complete(usage)
+		s.rememberResponse(turn, gen.finalResponse)
 	}
-	gen.complete(usage)
 	rl.done(outLen, usage, streamErr)
 }
 
 // --- 工具函数 ---
+
+// rememberResponse 從最終 Responses 物件取出 id / output 寫入歷史暫存。
+// 只有成功完成（有 id 與 output）的回應才會被記住。
+func (s *Server) rememberResponse(turn *respstate.Turn, resp map[string]any) {
+	if resp == nil || s.history == nil || jsonx.StrOf(resp["status"]) != "completed" {
+		return
+	}
+	id := jsonx.StrOf(resp["id"])
+	output, _ := resp["output"].([]any)
+	if id == "" || len(output) == 0 {
+		return
+	}
+	s.history.Remember(turn, id, output)
+}
 
 // rewriteResponsesModel 把 Responses 对象 / 事件里的 model 改为对外模型名。
 func rewriteResponsesModel(obj map[string]any, publicModel string) {
@@ -269,13 +343,13 @@ func responsesTextLen(obj map[string]any) int {
 		if !ok {
 			continue
 		}
-		switch strOf(item["type"]) {
+		switch jsonx.StrOf(item["type"]) {
 		case "message":
 			content, _ := item["content"].([]any)
 			for _, cv := range content {
 				c, ok := cv.(map[string]any)
 				if ok {
-					total += lenOfString(c["text"])
+					total += jsonx.LenOfString(c["text"])
 				}
 			}
 		case "reasoning":
@@ -283,7 +357,7 @@ func responsesTextLen(obj map[string]any) int {
 			for _, sv := range summary {
 				sm, ok := sv.(map[string]any)
 				if ok {
-					total += lenOfString(sm["text"])
+					total += jsonx.LenOfString(sm["text"])
 				}
 			}
 		}
@@ -293,11 +367,11 @@ func responsesTextLen(obj map[string]any) int {
 
 // responsesEventTextLen 统计单个流事件的文本增量长度。
 func responsesEventTextLen(obj map[string]any) int {
-	if strOf(obj["type"]) == "response.output_text.delta" {
-		return len([]rune(strOf(obj["delta"])))
+	if jsonx.StrOf(obj["type"]) == "response.output_text.delta" {
+		return len([]rune(jsonx.StrOf(obj["delta"])))
 	}
-	if strOf(obj["type"]) == "response.reasoning_summary_text.delta" {
-		return len([]rune(strOf(obj["delta"])))
+	if jsonx.StrOf(obj["type"]) == "response.reasoning_summary_text.delta" {
+		return len([]rune(jsonx.StrOf(obj["delta"])))
 	}
 	return 0
 }

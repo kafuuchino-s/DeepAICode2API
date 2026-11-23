@@ -221,46 +221,78 @@ type CheckInOutcome struct {
 	Err error
 }
 
+// checkInDueAt 判断账号此刻是否需要补签到（纯读，调用方持锁）。
+//
+// 三条规则与桌面端一致：被 check_in_refused 锁住 → 不签；已经回传过 →
+// 按半衰期 seconds/2 节流；最小间隔兜底（秒数很长时不被连续触发）。
+func checkInDueAt(st *checkInState, now time.Time) bool {
+	if st == nil {
+		return false
+	}
+	if !st.refusedUntil.IsZero() && now.Before(st.refusedUntil) {
+		return false
+	}
+	if st.checkIn != nil && st.checkIn.Valid() && !st.ackedAt.IsZero() {
+		ttl := time.Duration(st.checkIn.Seconds) * time.Second
+		if now.Sub(st.ackedAt) < ttl/2 {
+			return false
+		}
+	}
+	if !st.attemptAt.IsZero() && now.Sub(st.attemptAt) < checkInMinInterval {
+		return false
+	}
+	return true
+}
+
+// CheckInDue 报告账号此刻是否需要补签到（只读，不发请求）。
+//
+// 热路径（EnsureCheckIn）与后台预热（Server.WarmCheckIns）共用这一判据：
+// 预热只会让热路径更早看到「刚回传过」，不改变签到节奏，也不会造成额外风暴。
+func (c *Client) CheckInDue(acct *Account) bool {
+	if acct == nil {
+		return false
+	}
+	st := c.stateFor(acct)
+	c.checkIns.mu.Lock()
+	defer c.checkIns.mu.Unlock()
+	return checkInDueAt(st, time.Now())
+}
+
 // EnsureCheckIn 在推理前补一次签到（对应桌面端的 ensureCheckedIn）。
 //
 // 节奏与桌面端一致：以「上次回传完成」的时刻为基准，seconds/2（默认 300s）
 // 内不再打扰上游；从未回传过（冷启动 / 新号）则立即补一次，并用
 // attemptAt 限制最小间隔。任何失败都不阻塞推理：签到是附带条件，不是准入。
 func (c *Client) EnsureCheckIn(ctx context.Context, acct *Account) CheckInOutcome {
+	return c.EnsureCheckInWithin(ctx, acct, c.checkInBudget())
+}
+
+// EnsureCheckInWithin 与 EnsureCheckIn 同义，但用显式预算。
+//
+// 两个调用方对预算的诉求相反：
+//   - 热路径（推理前）要短：超过预算就先带旧 nonce 放行推理（默认 10s，可调到 2.5s）；
+//   - 后台预热（WarmCheckIns）可以长：它不在任何请求的关键路径上，
+//     给足 10s 才容易真正把 nonce 回传成功（线上住宅代理 p95 约 5s）。
+func (c *Client) EnsureCheckInWithin(ctx context.Context, acct *Account, budget time.Duration) CheckInOutcome {
 	var out CheckInOutcome
 	if acct == nil {
 		return out
 	}
 	st := c.stateFor(acct)
-	c.checkIns.mu.Lock()
-	ci, attemptAt, ackedAt := st.checkIn, st.attemptAt, st.ackedAt
-	refusedUntil := st.refusedUntil
-	c.checkIns.mu.Unlock()
-
 	now := time.Now()
-	// 被 check_in_refused 锁住的账号当天不再签到：推理仍可走替身分支，
-	// 继续打 /theos 只会浪费时间与风控预算（见 CheckInRefusedLock）。
-	if !refusedUntil.IsZero() && now.Before(refusedUntil) {
-		return out
-	}
-	// 已经回传过：按桌面端的半衰期节奏（seconds/2）节流。
-	if ci != nil && ci.Valid() && !ackedAt.IsZero() {
-		ttl := time.Duration(ci.Seconds) * time.Second
-		if now.Sub(ackedAt) < ttl/2 {
-			return out
-		}
-	}
-	// 最小间隔兜底：半衰期很长（例如 seconds=600）时也不会被连续触发。
-	if !attemptAt.IsZero() && now.Sub(attemptAt) < checkInMinInterval {
-		return out
-	}
 	c.checkIns.mu.Lock()
-	st.attemptAt = now
+	due := checkInDueAt(st, now)
+	if due {
+		st.attemptAt = now
+	}
 	c.checkIns.mu.Unlock()
+	if !due {
+		return out
+	}
 
 	out.Attempted = true
 	start := time.Now()
-	cctx, cancel := context.WithTimeout(ctx, c.checkInBudget())
+	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	// 结果（包括 403）都不影响推理；挑战在 captureCheckIn 里已经吃到。
 	_, out.Err = c.Theos(cctx, acct)
@@ -270,7 +302,14 @@ func (c *Client) EnsureCheckIn(ctx context.Context, acct *Account) CheckInOutcom
 }
 
 // checkInBudget 返回同步签到的等待预算。
+//
+// 优先级：Runtime 拉取值 → 实例值（SetCheckInBudget）→ 默认 10s。
 func (c *Client) checkInBudget() time.Duration {
+	if c.Runtime != nil {
+		if d := c.Runtime().CheckInBudget; d > 0 {
+			return d
+		}
+	}
 	if d := time.Duration(c.checkInBudgetNanos.Load()); d > 0 {
 		return d
 	}

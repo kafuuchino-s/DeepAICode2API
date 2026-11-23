@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/jsonx"
 )
 
 // --- Responses → Chat ---
@@ -16,7 +16,7 @@ import (
 func ResponsesReasoningEffort(payload map[string]any) string {
 	switch v := payload["reasoning"].(type) {
 	case map[string]any:
-		return strings.ToLower(strings.TrimSpace(StrOf(v["effort"])))
+		return strings.ToLower(strings.TrimSpace(jsonx.StrOf(v["effort"])))
 	case string:
 		return strings.ToLower(strings.TrimSpace(v))
 	}
@@ -24,10 +24,17 @@ func ResponsesReasoningEffort(payload map[string]any) string {
 }
 
 // ResponsesToChatPayload 把 Responses 请求翻译成 Chat Completions。
+//
+// 依赖上游响应状态的请求（`previous_response_id` / `conversation` /
+// `item_reference`）在这里直接报错：合成路径只有 `input` 里的内容，
+// 静默忽略这些字段会让客户端以为“续接成功”，实际上下文被截断。
 func ResponsesToChatPayload(payload map[string]any, modelID string) (map[string]any, error) {
+	if p := StatefulParam(payload); p != "" {
+		return nil, &StatefulParamError{Param: p}
+	}
 	out := map[string]any{
 		"model":  modelID,
-		"stream": BoolOf(payload["stream"]),
+		"stream": jsonx.BoolOf(payload["stream"]),
 	}
 	if v, ok := payload["temperature"]; ok {
 		out["temperature"] = v
@@ -35,7 +42,7 @@ func ResponsesToChatPayload(payload map[string]any, modelID string) (map[string]
 	if v, ok := payload["top_p"]; ok {
 		out["top_p"] = v
 	}
-	if v := IntOf(payload["max_output_tokens"]); v > 0 {
+	if v := jsonx.IntOf(payload["max_output_tokens"]); v > 0 {
 		out["max_tokens"] = v
 	}
 	if v, ok := payload["prompt_cache_key"]; ok {
@@ -47,44 +54,7 @@ func ResponsesToChatPayload(payload map[string]any, modelID string) (map[string]
 		out["reasoning_effort"] = effort
 	}
 
-	messages := make([]any, 0, 4)
-	if instructions, ok := payload["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
-		messages = append(messages, map[string]any{"role": "system", "content": instructions})
-	}
-	switch input := payload["input"].(type) {
-	case string:
-		messages = append(messages, map[string]any{"role": "user", "content": input})
-	case []any:
-		for _, itemv := range input {
-			item, ok := itemv.(map[string]any)
-			if !ok {
-				if s, ok := itemv.(string); ok {
-					messages = append(messages, map[string]any{"role": "user", "content": s})
-				}
-				continue
-			}
-			switch StrOf(item["type"]) {
-			case "message", "":
-				role := StrOf(item["role"])
-				if role == "" {
-					role = "user"
-				}
-				messages = append(messages, map[string]any{
-					"role": role, "content": ResponsesInputContent(item["content"]),
-				})
-			case "function_call":
-				appendResponsesFunctionCall(&messages, item)
-			case "function_call_output":
-				messages = append(messages, map[string]any{
-					"role":         "tool",
-					"tool_call_id": FirstString(item["call_id"], item["id"]),
-					"content":      ResponsesToolOutput(item["output"]),
-				})
-			case "reasoning":
-				// 历史推理内容不再回喂上游。
-			}
-		}
-	}
+	messages := responsesInputMessages(payload)
 	if len(messages) == 0 {
 		return nil, ErrNoMessages
 	}
@@ -94,11 +64,11 @@ func ResponsesToChatPayload(payload map[string]any, modelID string) (map[string]
 		converted := make([]any, 0, len(tools))
 		for _, tv := range tools {
 			t, ok := tv.(map[string]any)
-			if !ok || StrOf(t["type"]) != "function" {
+			if !ok || jsonx.StrOf(t["type"]) != "function" {
 				continue
 			}
-			fn := map[string]any{"name": StrOf(t["name"])}
-			if d := StrOf(t["description"]); d != "" {
+			fn := map[string]any{"name": jsonx.StrOf(t["name"])}
+			if d := jsonx.StrOf(t["description"]); d != "" {
 				fn["description"] = d
 			}
 			if p, ok := t["parameters"]; ok {
@@ -116,7 +86,58 @@ func ResponsesToChatPayload(payload map[string]any, modelID string) (map[string]
 	return out, nil
 }
 
-// ResponsesInputContent 转换 Responses 的 content 字段。
+// responsesInputMessages 把 Responses 的 instructions + input 展开为 chat messages。
+//
+// 单独抽出来只为可读性与复杂度：这里是「历史会不会被弄丢」的核心，
+// 每条分支都对应一种 item 形态（message / function_call / function_call_output）。
+// 未识别的 item 类型（web_search_call、code_interpreter_call 等**输出侧**条目）
+// 跳过：chat/completions 无法表达它们，而其中的用户可见结论通常已在
+// message 项里；真正会导致上下文缺失的 item_reference 已在入口处报错。
+func responsesInputMessages(payload map[string]any) []any {
+	messages := make([]any, 0, 4)
+	if instructions, ok := payload["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
+		messages = append(messages, map[string]any{"role": "system", "content": instructions})
+	}
+	switch input := payload["input"].(type) {
+	case string:
+		messages = append(messages, map[string]any{"role": "user", "content": input})
+	case []any:
+		for _, itemv := range input {
+			item, ok := itemv.(map[string]any)
+			if !ok {
+				if s, ok := itemv.(string); ok {
+					messages = append(messages, map[string]any{"role": "user", "content": s})
+				}
+				continue
+			}
+			switch jsonx.StrOf(item["type"]) {
+			case "message", "":
+				role := jsonx.StrOf(item["role"])
+				if role == "" {
+					role = "user"
+				}
+				messages = append(messages, map[string]any{
+					"role": role, "content": ResponsesInputContent(item["content"]),
+				})
+			case "function_call":
+				appendResponsesFunctionCall(&messages, item)
+			case "function_call_output":
+				messages = append(messages, map[string]any{
+					"role":         "tool",
+					"tool_call_id": jsonx.FirstString(item["call_id"], item["id"]),
+					"content":      ResponsesToolOutput(item["output"]),
+				})
+			case "reasoning":
+				// 历史推理内容不再回喂上游（与客户端一致）。
+			default:
+				// 其余是输出侧条目（web_search_call / code_interpreter_call / …），
+				// chat 无法表达；跳过不影响用户可见历史。
+			}
+		}
+	}
+	return messages
+}
+
 func ResponsesInputContent(v any) any {
 	switch c := v.(type) {
 	case string:
@@ -128,19 +149,19 @@ func ResponsesInputContent(v any) any {
 			if !ok {
 				continue
 			}
-			switch StrOf(p["type"]) {
+			switch jsonx.StrOf(p["type"]) {
 			case "input_text", "output_text", "text":
-				if t := StrOf(p["text"]); t != "" {
+				if t := jsonx.StrOf(p["text"]); t != "" {
 					parts = append(parts, map[string]any{"type": "text", "text": t})
 				}
 			case "input_image":
-				if u := StrOf(p["image_url"]); u != "" {
+				if u := jsonx.StrOf(p["image_url"]); u != "" {
 					parts = append(parts, map[string]any{
 						"type": "image_url", "image_url": map[string]any{"url": u},
 					})
 				}
 			case "refusal":
-				if t := StrOf(p["refusal"]); t != "" {
+				if t := jsonx.StrOf(p["refusal"]); t != "" {
 					parts = append(parts, map[string]any{"type": "text", "text": t})
 				}
 			}
@@ -161,14 +182,14 @@ func ResponsesInputContent(v any) any {
 // 合并后一条 assistant 带多个 tool_calls，后面的 function_call_output 才能正确对应。
 func appendResponsesFunctionCall(messages *[]any, item map[string]any) {
 	call := map[string]any{
-		"id": FirstString(item["call_id"], item["id"]), "type": "function",
+		"id": jsonx.FirstString(item["call_id"], item["id"]), "type": "function",
 		"function": map[string]any{
-			"name":      StrOf(item["name"]),
-			"arguments": StrOf(item["arguments"]),
+			"name":      jsonx.StrOf(item["name"]),
+			"arguments": jsonx.StrOf(item["arguments"]),
 		},
 	}
 	if n := len(*messages); n > 0 {
-		if last, ok := (*messages)[n-1].(map[string]any); ok && StrOf(last["role"]) == "assistant" {
+		if last, ok := (*messages)[n-1].(map[string]any); ok && jsonx.StrOf(last["role"]) == "assistant" {
 			if tcs, ok := last["tool_calls"].([]any); ok {
 				last["tool_calls"] = append(tcs, call)
 				return
@@ -200,8 +221,8 @@ func ConvertResponsesToolChoice(v any) any {
 	case string:
 		return tc
 	case map[string]any:
-		if StrOf(tc["type"]) == "function" && StrOf(tc["name"]) != "" {
-			return map[string]any{"type": "function", "function": map[string]any{"name": StrOf(tc["name"])}}
+		if jsonx.StrOf(tc["type"]) == "function" && jsonx.StrOf(tc["name"]) != "" {
+			return map[string]any{"type": "function", "function": map[string]any{"name": jsonx.StrOf(tc["name"])}}
 		}
 	}
 	return nil
@@ -219,17 +240,17 @@ func ChatToResponsesObject(chat map[string]any, publicModel string) map[string]a
 	if len(choices) > 0 {
 		if cm, ok := choices[0].(map[string]any); ok {
 			if msg, ok := cm["message"].(map[string]any); ok {
-				if r := StrOf(msg["reasoning"]); r != "" {
+				if r := jsonx.StrOf(msg["reasoning"]); r != "" {
 					reasoningText = r
 					output = append(output, map[string]any{
-						"type": "reasoning", "id": "rs_" + deepai.RandomHex(12),
+						"type": "reasoning", "id": newID("rs"),
 						"summary": []any{map[string]any{"type": "summary_text", "text": r}},
 					})
 				}
-				if t := StrOf(msg["content"]); t != "" {
+				if t := jsonx.StrOf(msg["content"]); t != "" {
 					outputText = t
 					output = append(output, map[string]any{
-						"type": "message", "id": "msg_" + deepai.RandomHex(12),
+						"type": "message", "id": newID("msg"),
 						"status": "completed", "role": "assistant",
 						"content": []any{map[string]any{"type": "output_text", "text": t, "annotations": []any{}}},
 					})
@@ -240,14 +261,14 @@ func ChatToResponsesObject(chat map[string]any, publicModel string) map[string]a
 						if !ok {
 							continue
 						}
-						callID := StrOf(tc["id"])
+						callID := jsonx.StrOf(tc["id"])
 						name, args := "", ""
 						if fn, ok := tc["function"].(map[string]any); ok {
-							name = StrOf(fn["name"])
-							args = StrOf(fn["arguments"])
+							name = jsonx.StrOf(fn["name"])
+							args = jsonx.StrOf(fn["arguments"])
 						}
 						output = append(output, map[string]any{
-							"type": "function_call", "id": "fc_" + deepai.RandomHex(12),
+							"type": "function_call", "id": newID("fc"),
 							"call_id": callID, "name": name, "arguments": args,
 							"status": "completed",
 						})
@@ -259,7 +280,7 @@ func ChatToResponsesObject(chat map[string]any, publicModel string) map[string]a
 
 	usage := ParseUsage(chat["usage"])
 	resp := map[string]any{
-		"id":                  "resp_" + deepai.RandomHex(12),
+		"id":                  newID("resp"),
 		"object":              "response",
 		"created_at":          time.Now().Unix(),
 		"status":              "completed",
